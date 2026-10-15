@@ -40,10 +40,25 @@ expected="$(awk -v name="$archive" '$2 == name {print $1; count++} END {if(count
 if command -v sha256sum >/dev/null; then actual="$(sha256sum "$task_tmp/$archive")"; else actual="$(shasum -a 256 "$task_tmp/$archive")"; fi
 actual="${actual%% *}"
 [[ "$actual" == "$expected" ]] || { printf 'Checksum mismatch: refusing installation\n' >&2; exit 1; }
-[[ "$(tar -tzf "$task_tmp/$archive")" == ylcc ]] || { printf 'Unexpected archive contents\n' >&2; exit 1; }
-tar -xzf "$task_tmp/$archive" -C "$task_tmp"
-[[ -f "$task_tmp/ylcc" && ! -L "$task_tmp/ylcc" ]] || { printf 'Archive binary must be a regular file\n' >&2; exit 1; }
+# Validate names, duplicates and file types before writing any destination file.
+members="$(LC_ALL=C tar -tzf "$task_tmp/$archive" | LC_ALL=C sort)"
+[[ "$members" == $'LICENSE\nTHIRD_PARTY_NOTICES.txt\nylcc' ]] || { printf 'Unexpected archive contents\n' >&2; exit 1; }
+LC_ALL=C tar -tvzf "$task_tmp/$archive" | awk '
+  substr($0, 1, 1) != "-" {bad=1}
+  END {if (NR != 3 || bad) exit 1}
+' || { printf 'Archive members must be regular files\n' >&2; exit 1; }
+# Stream named members rather than extracting paths or archive-owned permissions.
+for member in ylcc LICENSE THIRD_PARTY_NOTICES.txt; do
+  tar -xOzf "$task_tmp/$archive" "$member" > "$task_tmp/$member"
+done
 mkdir -p "$prefix/bin"
+mkdir -p "$prefix/share/licenses/ylcc"
+for member in LICENSE THIRD_PARTY_NOTICES.txt; do
+  install_tmp="$(mktemp "$prefix/share/licenses/ylcc/.notice.XXXXXX")"
+  install -m 644 "$task_tmp/$member" "$install_tmp"
+  mv -f "$install_tmp" "$prefix/share/licenses/ylcc/$member"
+  install_tmp=''
+done
 install_tmp="$(mktemp "$prefix/bin/.ylcc.XXXXXX")"
 install -m 755 "$task_tmp/ylcc" "$install_tmp"
 mv -f "$install_tmp" "$prefix/bin/ylcc"

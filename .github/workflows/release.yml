@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust stable
-        run: rustup update stable --no-self-update && rustup default stable && rustup target add '${{ matrix.target }}'
+        run: rustup update stable --no-self-update && rustup default stable && rustup target add '${{ matrix.target }}' && rustup component add rust-docs
       - name: Check release tag matches package version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -42,6 +42,8 @@ jobs:
           CC: ${{ matrix.os == 'linux' && 'gcc' || 'clang' }}
           MACOSX_DEPLOYMENT_TARGET: '13.0'
         run: |
+          cargo fetch --locked
+          python3 scripts/generate-notices.py --check
           cargo test --locked --target '${{ matrix.target }}'
           cargo build --locked --release --target '${{ matrix.target }}'
           python3 tests/e2e.py 'target/${{ matrix.target }}/release/ylcc'
@@ -49,8 +51,10 @@ jobs:
           python3 tests/test_macos_storage.py
           mkdir -p dist
           cp 'target/${{ matrix.target }}/release/ylcc' dist/ylcc
+          cp LICENSE dist/LICENSE
+          python3 scripts/generate-notices.py --output dist/THIRD_PARTY_NOTICES.txt
           dist/ylcc --version
-          tar -czf 'ylcc-${{ matrix.os }}-${{ matrix.arch }}.tar.gz' -C dist ylcc
+          tar -czf 'ylcc-${{ matrix.os }}-${{ matrix.arch }}.tar.gz' -C dist ylcc LICENSE THIRD_PARTY_NOTICES.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ylcc-${{ matrix.os }}-${{ matrix.arch }}

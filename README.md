@@ -48,7 +48,7 @@ Use `--prefix /your/prefix` to change the install location. You can also downloa
 
 ### Download examples and agent support files
 
-The binary installer installs the executable only. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
+The binary installer installs the executable and license notices. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
 
 ```bash
 export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.0"
@@ -232,7 +232,8 @@ Native workers can use an already configured Docker or Podman runtime. To reques
 
 ```bash
 mkdir -p "$YLCC_SUPPORT_DIR/dist"
-cp /path/to/matching-linux-binary/ylcc "$YLCC_SUPPORT_DIR/dist/ylcc"
+# Extract the verified Linux release archive for the runtime CPU; arm64 example:
+tar -xzf /path/to/ylcc-linux-aarch64.tar.gz -C "$YLCC_SUPPORT_DIR/dist"
 docker build --target runtime-client -t ylcc-runtime-client:0.1.0 \
   -f "$YLCC_SUPPORT_DIR/Dockerfile" "$YLCC_SUPPORT_DIR"
 ```
