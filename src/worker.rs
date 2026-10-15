@@ -665,6 +665,11 @@ fn expanded_env(
     values
 }
 
+fn normalize_image_id(value: &str) -> Result<String> {
+    let hash = value.trim().strip_prefix("sha256:").unwrap_or(value.trim());
+    validate_hash(hash).context("runtime returned invalid image ID")?;
+    Ok(format!("sha256:{hash}"))
+}
 async fn image_path(state: &State, image: &str) -> Result<String> {
     ensure!(
         image.starts_with("sha256:"),
@@ -1294,11 +1299,7 @@ async fn resolve_job_image(
             capture(inspect()).await?
         }
     };
-    ensure!(
-        id.starts_with("sha256:") && id.len() == 71,
-        "runtime returned invalid image ID"
-    );
-    Ok(id)
+    normalize_image_id(&id)
 }
 
 async fn verify_container_mount(
@@ -1829,7 +1830,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
             let mut command = Command::new(runtime); command.args(["pull", "--platform", &format!("linux/{}", image_arch(&state.capabilities.arch)?), image]);
             let exit = execute(state, &logger, command, receiver, 3600, None).await?; drop(cancel); ensure!(exit == 0, "image pull failed");
             let mut inspect = Command::new(runtime); inspect.args(["image", "inspect", "--format", "{{.Id}}", image]);
-            let id = capture(inspect).await?; ensure!(id.starts_with("sha256:") && id.len() == 71, "runtime returned invalid image ID"); image_id = Some(id);
+            image_id = Some(normalize_image_id(&capture(inspect).await?)?);
         } else {
             let values = expanded_env(Some(environment), None, &dir, None);
             for script in &environment.setup {
@@ -2156,6 +2157,16 @@ fn rocm_accessible() -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn docker_and_podman_image_ids_normalize_to_the_same_digest() {
+        let hash = "a".repeat(64);
+        let expected = format!("sha256:{hash}");
+        assert_eq!(normalize_image_id(&hash).unwrap(), expected);
+        assert_eq!(normalize_image_id(&format!("{expected}\n")).unwrap(), expected);
+        for invalid in ["", "short", "sha512:abc", &"A".repeat(64)] {
+            assert!(normalize_image_id(invalid).is_err());
+        }
+    }
+    #[test]
     fn host_abi_is_independent_of_ylcc_linkage() {
         assert_eq!(host_linux_abi("glibc 2.43", ""), "gnu");
         assert_eq!(host_linux_abi("", "musl libc (x86_64)"), "musl");
@@ -2387,7 +2398,8 @@ mod tests {
             execute(&state, &attempt, command, receiver, 10, None),
             cancellation
         );
-        assert!(result.unwrap_err().to_string().contains("job cancelled"));
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("job cancelled"), "{error:#}");
         let pgid = attempt.journal.lock().unwrap().pid.unwrap();
         assert!(process_group_absent(pgid).unwrap());
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -2425,7 +2437,7 @@ mod tests {
         let error = execute(&state, &attempt, command, receiver, 1, None)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("exceeded timeout"));
+        assert!(error.to_string().contains("exceeded timeout"), "{error:#}");
         let pgid = attempt.journal.lock().unwrap().pid.unwrap();
         assert!(process_group_absent(pgid).unwrap());
         tokio::time::sleep(Duration::from_millis(2200)).await;

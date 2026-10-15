@@ -350,7 +350,7 @@ pub fn install_system_user(
             ("-x", env::current_exe()?.as_path()),
         ] {
             let status = Command::new("/usr/bin/sudo")
-                .args(["-n", "-u", service_user, "--", "/usr/bin/test", flag])
+                .args(["-n", "-u", service_user, "--", "/bin/test", flag])
                 .arg(path)
                 .status()?;
             if !status.success() {
@@ -426,6 +426,17 @@ pub fn uninstall_system_user(role: &str, service_user: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn managed_access_probe_uses_the_macos_test_binary() {
+        assert!(
+            Command::new("/bin/test")
+                .args(["-x", "/bin/test"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     #[test]
     fn systemd_does_not_expand_paths_or_inject_lines() {
         let unit = systemd_unit(
