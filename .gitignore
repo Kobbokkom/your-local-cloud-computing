@@ -1,0 +1,4 @@
+/target/
+/.ylcc/
+*.token
+*.db
