@@ -30,6 +30,8 @@ struct Journal {
     pid: Option<u32>,
     #[serde(default)]
     container: Option<String>,
+    #[serde(default)]
+    runtime: Option<String>,
 }
 struct Attempt {
     dir: PathBuf,
@@ -48,8 +50,18 @@ struct State {
     drain: RwLock<()>,
     attempts: Mutex<HashMap<String, Arc<Attempt>>>,
     environments: Mutex<BTreeMap<String, EnvironmentStatus>>,
+    image_paths: Mutex<HashMap<String, String>>,
     events: broadcast::Sender<WorkerMessage>,
 }
+
+#[derive(Debug)]
+struct UncertainCleanup(String);
+impl std::fmt::Display for UncertainCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for UncertainCleanup {}
 
 fn identifier(value: &str) -> Result<()> {
     ensure!(
@@ -234,6 +246,7 @@ pub async fn run(
         drain: RwLock::new(()),
         attempts: Mutex::new(HashMap::new()),
         environments: Mutex::new(BTreeMap::new()),
+        image_paths: Mutex::new(HashMap::new()),
         events,
     });
     load_state(&state).await?;
@@ -359,7 +372,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
                 None
             };
             let logger = environment_logger(state, &definition)?;
-            verify_environment(state, &definition, image.as_deref(), &logger).await?;
+            verify_environment(state, &definition, image.as_deref(), &logger, None).await?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -483,9 +496,8 @@ async fn connection(state: Arc<State>) -> Result<()> {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<HubMessage>(&text)? {
                     HubMessage::Run { job, environment } => accept(state.clone(), *job, environment)?,
                     HubMessage::Cancel { job_id, attempt_id } => {
-                        if let Some(attempt) = state.attempts.lock().unwrap().get(&attempt_id) {
-                            ensure!(attempt.report().job_id == job_id, "cancel job identity mismatch"); let _ = attempt.cancel.send(true);
-                        }
+                        let state = state.clone();
+                        tokio::spawn(async move { if let Err(error) = request_cancel(&state, &job_id, &attempt_id).await { eprintln!("cancel reconciliation: {error:#}"); } });
                     }
                     HubMessage::Prepare { environment } => {
                         let state = state.clone(); tokio::spawn(async move { if let Err(e) = prepare(&state, &environment, true).await { eprintln!("environment preparation: {e:#}"); } });
@@ -543,6 +555,7 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
         seq: 0,
         pid: None,
         container: None,
+        runtime: None,
     };
     atomic_json(&dir.join("journal.json"), &journal)?;
     atomic_json(&dir.join("job.json"), &job.spec)?;
@@ -564,8 +577,14 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
         )
         .await;
         let outcome = attempt.update(|journal| {
-            journal.pid = None;
-            journal.container = None;
+            let uncertain = result
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<UncertainCleanup>().is_some());
+            if !uncertain {
+                journal.pid = None;
+                journal.container = None;
+                journal.runtime = None;
+            }
             match result {
                 Ok((exit, outputs)) => {
                     journal.report.exit_code = Some(exit);
@@ -573,7 +592,9 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
                     journal.report.state = if exit == 0 { "succeeded" } else { "failed" }.into();
                 }
                 Err(error) => {
-                    journal.report.state = if *receiver.borrow() {
+                    journal.report.state = if uncertain {
+                        "unknown"
+                    } else if *receiver.borrow() {
                         "cancelled"
                     } else {
                         "failed"
@@ -599,20 +620,26 @@ fn expanded_env(
     environment: Option<&Environment>,
     job: Option<&JobSpec>,
     dir: &Path,
-    image: bool,
+    image_path: Option<&str>,
 ) -> BTreeMap<String, String> {
+    let image = image_path.is_some();
     let env_dir = if image {
         "/ylcc-env".into()
     } else {
         dir.to_string_lossy().into_owned()
     };
-    let base_path = if image {
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
-    } else {
-        std::env::var("PATH").unwrap_or_default()
-    };
+    let base_path = image_path
+        .map(str::to_owned)
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let mut values = BTreeMap::new();
-    values.insert("PATH".into(), format!("{env_dir}/bin:{base_path}"));
+    values.insert(
+        "PATH".into(),
+        if base_path.is_empty() {
+            format!("{env_dir}/bin")
+        } else {
+            format!("{env_dir}/bin:{base_path}")
+        },
+    );
     if image {
         values.insert("HOME".into(), env_dir.clone());
         values.insert("XDG_CACHE_HOME".into(), format!("{env_dir}/cache"));
@@ -636,6 +663,41 @@ fn expanded_env(
     }
     values.insert("YLCC_ENV_DIR".into(), env_dir);
     values
+}
+
+async fn image_path(state: &State, image: &str) -> Result<String> {
+    ensure!(
+        image.starts_with("sha256:"),
+        "image metadata must be keyed by immutable local image ID"
+    );
+    if let Some(path) = state.image_paths.lock().unwrap().get(image).cloned() {
+        return Ok(path);
+    }
+    let mut command = Command::new(runtime(state)?);
+    command.args([
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.Env}}",
+        image,
+    ]);
+    let values: Option<Vec<String>> = serde_json::from_str(
+        &capture(command)
+            .await
+            .context("inspect actual image PATH")?,
+    )?;
+    let path = values
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.strip_prefix("PATH=").map(str::to_owned))
+        .next_back()
+        .unwrap_or_default();
+    state
+        .image_paths
+        .lock()
+        .unwrap()
+        .insert(image.into(), path.clone());
+    Ok(path)
 }
 fn runtime(state: &State) -> Result<&str> {
     state.capabilities.runtimes.first().map(String::as_str).context("no usable Docker or Podman runtime; install/configure one under the worker service account")
@@ -727,35 +789,160 @@ async fn pipe_logs(
     }
     Ok(())
 }
-async fn stop_process(child: &mut tokio::process::Child, container: Option<(&str, &str)>) {
-    if let Some((runtime, name)) = container {
-        let mut cleanup = Command::new(runtime);
-        cleanup
-            .args(["rm", "-f", name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let _ = tokio::time::timeout(Duration::from_secs(15), cleanup.status()).await;
-    }
+fn process_group_absent(pgid: u32) -> Result<bool> {
+    ensure!(
+        pgid > 1 && pgid <= i32::MAX as u32,
+        "invalid saved process group"
+    );
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
-        }
-    }
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
     {
-        #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
+        if unsafe { libc::kill(-(pgid as i32), 0) } == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(true);
+        }
+        Err(error).context("cannot inspect process group")
+    }
+    #[cfg(not(unix))]
+    bail!("process group inspection requires Unix")
+}
+fn signal_group(pgid: u32, signal: i32) -> Result<()> {
+    ensure!(pgid > 1 && pgid <= i32::MAX as u32, "invalid process group");
+    #[cfg(unix)]
+    {
+        if unsafe { libc::kill(-(pgid as i32), signal) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("signal process group");
             }
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
     }
+    Ok(())
+}
+async fn container_absent(runtime: &str, name: &str) -> Result<bool> {
+    let mut inspect = Command::new(runtime);
+    inspect.args(["container", "inspect", "--format", "{{.Id}}", name]);
+    if capture(inspect).await.is_ok() {
+        return Ok(false);
+    }
+    // A failed inspect can mean a dead daemon. A successful listing is required to prove absence.
+    let mut list = Command::new(runtime);
+    list.args(["ps", "-a", "--format", "{{.Names}}"]);
+    let names = capture(list)
+        .await
+        .context("container absence cannot be confirmed while the runtime is unavailable")?;
+    Ok(!names
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .any(|value| value == name))
+}
+async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> Result<()> {
+    let attempt = state.attempts.lock().unwrap().get(attempt_id).cloned();
+    let Some(attempt) = attempt else {
+        return Ok(());
+    };
+    ensure!(
+        attempt.report().job_id == job_id,
+        "cancel job identity mismatch"
+    );
+    if attempt.cancel.send(true).is_ok() {
+        return Ok(());
+    }
+    let journal = attempt.journal.lock().unwrap().clone();
+    if matches!(
+        journal.report.state.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) {
+        state.emit(WorkerMessage::Finished {
+            report: journal.report,
+        });
+        return Ok(());
+    }
+    let evidence = async {
+        let pgid = journal.pid.context("no process-group evidence was saved; fence the original execution before resolving this attempt")?;
+        ensure!(process_group_absent(pgid)?, "saved process group {pgid} still exists; inspect/fence the original execution and retry cancel (saved PIDs are never signalled after restart)");
+        if let Some(name) = &journal.container {
+            let runtime = journal.runtime.as_deref().context("container runtime was not saved; inspect/fence the original container before resolving this attempt")?;
+            ensure!(container_absent(runtime, name).await?, "container {name} still exists; stop/remove the original container and retry cancel");
+        }
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    let report = attempt.update(|journal| match &evidence {
+        Ok(()) => {
+            journal.report.state = "cancelled".into();
+            journal.report.error = Some(
+                "cancelled after confirming the original process group and container are absent"
+                    .into(),
+            );
+            journal.pid = None;
+            journal.container = None;
+            journal.runtime = None;
+        }
+        Err(error) => {
+            journal.report.state = "unknown".into();
+            journal.report.error = Some(format!("cancellation remains unresolved: {error:#}"));
+        }
+    })?;
+    state.emit(WorkerMessage::Finished { report });
+    Ok(())
+}
+async fn stop_process(
+    child: &mut tokio::process::Child,
+    pgid: u32,
+    container: Option<(&str, &str)>,
+) -> Result<()> {
+    let result = async {
+        signal_group(pgid, libc::SIGTERM)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = child.try_wait()?;
+            if process_group_absent(pgid)? {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // The leader may already have exited. The saved group still owns all remaining children.
+                signal_group(pgid, libc::SIGKILL)?;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .context("process leader did not stop")??;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !process_group_absent(pgid)? {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "process group {pgid} remains after SIGKILL"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let container_result = async {
+        if let Some((runtime, name)) = container {
+            let mut cleanup = Command::new(runtime);
+            cleanup
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let _ = tokio::time::timeout(Duration::from_secs(15), cleanup.status()).await;
+            ensure!(
+                container_absent(runtime, name).await?,
+                "container {name} remains after cleanup"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    result.and(container_result).map_err(|error| {
+        anyhow::Error::new(UncertainCleanup(format!(
+            "execution cleanup could not be confirmed: {error:#}"
+        )))
+    })
 }
 async fn execute(
     state: &Arc<State>,
@@ -776,10 +963,20 @@ async fn execute(
         command.process_group(0);
     }
     let mut child = command.spawn().context("start command")?;
-    attempt.update(|journal| {
-        journal.pid = child.id();
+    let pgid = child.id().context("spawned process has no PID")?;
+    if let Err(error) = attempt.update(|journal| {
+        journal.pid = Some(pgid);
         journal.container = container.as_ref().map(|(_, name)| name.clone());
-    })?;
+        journal.runtime = container.as_ref().map(|(runtime, _)| runtime.clone());
+    }) {
+        stop_process(
+            &mut child,
+            pgid,
+            container.as_ref().map(|(r, n)| (r.as_str(), n.as_str())),
+        )
+        .await?;
+        return Err(error);
+    }
     let stdout = tokio::spawn(pipe_logs(
         child.stdout.take().unwrap(),
         state.clone(),
@@ -794,24 +991,25 @@ async fn execute(
     ));
     let outcome = tokio::select! {
         result = child.wait() => result.map_err(anyhow::Error::from),
-        _ = cancel.changed() => { stop_process(&mut child, container.as_ref().map(|(r,n)| (r.as_str(),n.as_str()))).await; Err(anyhow::anyhow!("job cancelled")) },
-        _ = tokio::time::sleep(Duration::from_secs(timeout)) => { stop_process(&mut child, container.as_ref().map(|(r,n)| (r.as_str(),n.as_str()))).await; Err(anyhow::anyhow!("command exceeded timeout of {timeout}s")) },
+        _ = cancel.changed() => Err(anyhow::anyhow!("job cancelled")),
+        _ = tokio::time::sleep(Duration::from_secs(timeout)) => Err(anyhow::anyhow!("command exceeded timeout of {timeout}s")),
     };
-    // Descendants may retain stdout after their parent exits. Close the group before waiting for pipes.
-    #[cfg(unix)]
-    if let Some(pid) = attempt.journal.lock().unwrap().pid {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
-        }
-    }
+    let cleanup = stop_process(
+        &mut child,
+        pgid,
+        container.as_ref().map(|(r, n)| (r.as_str(), n.as_str())),
+    )
+    .await;
     let logs = async {
         stdout.await??;
         stderr.await??;
         Ok::<_, anyhow::Error>(())
     };
-    tokio::time::timeout(Duration::from_secs(5), logs)
+    let logs = tokio::time::timeout(Duration::from_secs(5), logs)
         .await
-        .context("command descendants retained output pipes")??;
+        .context("command descendants retained output pipes");
+    cleanup?;
+    logs??;
     let status = outcome?;
     Ok(status.code().unwrap_or(128 + signal_number(&status)))
 }
@@ -860,11 +1058,46 @@ async fn run_attempt(
         attempt.dir.join("environment")
     };
     private_dir(&env_dir)?;
-    let image = if let Some(environment) = environment.filter(|e| e.image.is_some()) {
+    let mut image = if let Some(environment) = environment.filter(|e| e.image.is_some()) {
         Some(resolved_image(state, environment)?)
     } else {
         job.spec.container.clone()
     };
+    if environment.is_none()
+        && let Some(reference) = &image
+    {
+        image = Some(resolve_job_image(state, attempt, reference, cancel.clone()).await?);
+    }
+    if let Some(environment) = environment {
+        let ready = state
+            .environments
+            .lock()
+            .unwrap()
+            .get(&env_key(&environment.id, &environment.revision))
+            .is_some_and(|status| status.state == "ready");
+        ensure!(
+            ready,
+            "environment is no longer ready; inspect its status and explicitly prepare it again"
+        );
+        if let Err(error) = verify_environment(
+            state,
+            environment,
+            image.as_deref(),
+            attempt,
+            Some(cancel.clone()),
+        )
+        .await
+        {
+            if !*cancel.borrow() {
+                state.environment_status(
+                    environment,
+                    "failed",
+                    Some(format!("pre-job environment verification: {error:#}")),
+                )?;
+            }
+            return Err(error).context("environment drift detected before execution");
+        }
+    }
     let workdir = attempt.dir.join("work");
     fs::create_dir(&workdir).context("create fresh attempt checkout")?;
     for input in &job.spec.inputs {
@@ -881,7 +1114,12 @@ async fn run_attempt(
             fs::set_permissions(&dest, fs::Permissions::from_mode(input.mode & 0o777))?;
         }
     }
-    let mut values = expanded_env(environment, Some(&job.spec), &env_dir, image.is_some());
+    let path = if let Some(image) = &image {
+        Some(image_path(state, image).await?)
+    } else {
+        None
+    };
+    let mut values = expanded_env(environment, Some(&job.spec), &env_dir, path.as_deref());
     values.insert("YLCC_JOB_ID".into(), job.id.clone());
     values.insert("YLCC_ATTEMPT_ID".into(), job.attempt_id.clone());
     if let Some(image) = image.as_deref() {
@@ -1012,6 +1250,42 @@ async fn run_attempt(
         results.push(entry);
     }
     Ok((exit, results))
+}
+
+async fn resolve_job_image(
+    state: &Arc<State>,
+    attempt: &Arc<Attempt>,
+    image: &str,
+    cancel: watch::Receiver<bool>,
+) -> Result<String> {
+    let runtime = runtime(state)?;
+    let inspect = || {
+        let mut command = Command::new(runtime);
+        command.args(["image", "inspect", "--format", "{{.Id}}", image]);
+        command
+    };
+    let id = match capture(inspect()).await {
+        Ok(id) => id,
+        Err(_) => {
+            let mut pull = Command::new(runtime);
+            pull.args([
+                "pull",
+                "--platform",
+                &format!("linux/{}", image_arch(&state.capabilities.arch)?),
+                image,
+            ]);
+            ensure!(
+                execute(state, attempt, pull, cancel, 3600, None).await? == 0,
+                "image pull failed"
+            );
+            capture(inspect()).await?
+        }
+    };
+    ensure!(
+        id.starts_with("sha256:") && id.len() == 71,
+        "runtime returned invalid image ID"
+    );
+    Ok(id)
 }
 
 async fn verify_container_mount(
@@ -1374,6 +1648,7 @@ fn environment_logger(state: &State, environment: &Environment) -> Result<Arc<At
             seq,
             pid: None,
             container: None,
+            runtime: None,
         }),
     }))
 }
@@ -1382,9 +1657,15 @@ async fn verify_environment(
     environment: &Environment,
     image: Option<&str>,
     logger: &Arc<Attempt>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     let dir = state.environment_dir(environment)?;
-    let values = expanded_env(Some(environment), None, &dir, image.is_some());
+    let path = if let Some(image) = image {
+        Some(image_path(state, image).await?)
+    } else {
+        None
+    };
+    let values = expanded_env(Some(environment), None, &dir, path.as_deref());
     let context = image.map(|image| (&**state, image, dir.as_path(), dir.as_path()));
     verify_tools(&environment.requirements, &values, context).await?;
     if let Some(image) = image {
@@ -1412,7 +1693,8 @@ async fn verify_environment(
     }
     for script in &environment.verify {
         logger.log(state, "system", "verifying environment\n".into())?;
-        let (cancel, receiver) = watch::channel(false);
+        let (keepalive, receiver) = watch::channel(false);
+        let receiver = cancel.clone().unwrap_or(receiver);
         let mut container = None;
         let command = if let Some(image) = image {
             let name = format!("ylcc-verify-{}", uuid::Uuid::new_v4());
@@ -1437,7 +1719,7 @@ async fn verify_environment(
             command
         };
         let result = execute(state, logger, command, receiver, 600, container).await;
-        drop(cancel);
+        drop(keepalive);
         ensure!(result? == 0, "environment verification failed");
     }
     Ok(())
@@ -1536,7 +1818,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
             let mut inspect = Command::new(runtime); inspect.args(["image", "inspect", "--format", "{{.Id}}", image]);
             let id = capture(inspect).await?; ensure!(id.starts_with("sha256:") && id.len() == 71, "runtime returned invalid image ID"); image_id = Some(id);
         } else {
-            let values = expanded_env(Some(environment), None, &dir, false);
+            let values = expanded_env(Some(environment), None, &dir, None);
             for script in &environment.setup {
                 logger.log(state, "system", "preparing environment\n".into())?;
                 let mut command = Command::new("sh"); command.args(["-eu", "-c", script]).current_dir(&dir).envs(&values);
@@ -1544,7 +1826,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
                 let exit = execute(state, &logger, command, receiver, 3600, None).await?; drop(cancel); ensure!(exit == 0, "environment setup failed");
             }
         }
-        verify_environment(state, environment, image_id.as_deref(), &logger).await?;
+        verify_environment(state, environment, image_id.as_deref(), &logger, None).await?;
         if let Some(image) = image_id { atomic_json(&dir.join("image.json"), &image)?; }
         Ok::<_, anyhow::Error>(())
     }.await;
@@ -1579,10 +1861,16 @@ pub async fn probe() -> Result<Capabilities> {
     }
     let abi = if os == "macos" {
         "darwin"
-    } else if cfg!(target_env = "musl") {
-        "musl"
     } else {
-        "gnu"
+        // A static musl YLCC binary can run workloads on a glibc host.
+        let mut getconf = Command::new("getconf");
+        getconf.arg("GNU_LIBC_VERSION");
+        let mut ldd = Command::new("ldd");
+        ldd.arg("--version");
+        host_linux_abi(
+            &capture(getconf).await.unwrap_or_default(),
+            &capture(ldd).await.unwrap_or_default(),
+        )
     }
     .into();
     let mut tools = BTreeMap::new();
@@ -1759,6 +2047,16 @@ print(MPSSupportsMTLDevice(device) ? "metal mps" : "metal")"##;
     })
 }
 
+fn host_linux_abi(getconf: &str, ldd: &str) -> &'static str {
+    if getconf.starts_with("glibc ") || ldd.contains("GNU libc") || ldd.contains("GLIBC") {
+        "gnu"
+    } else if ldd.contains("musl") {
+        "musl"
+    } else {
+        "unknown"
+    }
+}
+
 #[cfg(target_os = "linux")]
 unsafe fn symbol<T: Copy>(library: *mut libc::c_void, name: &std::ffi::CStr) -> Option<T> {
     let pointer = unsafe { libc::dlsym(library, name.as_ptr()) };
@@ -1844,6 +2142,12 @@ fn rocm_accessible() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_abi_is_independent_of_ylcc_linkage() {
+        assert_eq!(host_linux_abi("glibc 2.43", ""), "gnu");
+        assert_eq!(host_linux_abi("", "musl libc (x86_64)"), "musl");
+        assert_eq!(host_linux_abi("", ""), "unknown");
+    }
     fn state_at(data: &Path) -> Arc<State> {
         for path in [
             data.to_path_buf(),
@@ -1870,6 +2174,7 @@ mod tests {
             drain: RwLock::new(()),
             attempts: Mutex::new(HashMap::new()),
             environments: Mutex::new(BTreeMap::new()),
+            image_paths: Mutex::new(HashMap::new()),
             events,
         })
     }
@@ -1889,6 +2194,7 @@ mod tests {
             seq: 0,
             pid: None,
             container: None,
+            runtime: None,
         };
         atomic_json(&dir.join("journal.json"), &journal).unwrap();
         Arc::new(Attempt {
@@ -2013,6 +2319,222 @@ mod tests {
         assert!(logs.contains("before"));
         assert!(logs.contains("error"));
     }
+    #[tokio::test]
+    async fn cancellation_kills_term_ignoring_child_after_leader_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "(trap '' TERM; printf ready > ready; sleep 3; touch leaked) & wait",
+            ])
+            .current_dir(temp.path());
+        let (cancel, receiver) = watch::channel(false);
+        let cancellation = async {
+            while !temp.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel.send(true).unwrap();
+        };
+        let (result, _) = tokio::join!(
+            execute(&state, &attempt, command, receiver, 10, None),
+            cancellation
+        );
+        assert!(result.unwrap_err().to_string().contains("job cancelled"));
+        let pgid = attempt.journal.lock().unwrap().pid.unwrap();
+        assert!(process_group_absent(pgid).unwrap());
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!temp.path().join("leaked").exists());
+    }
+    #[tokio::test]
+    async fn natural_parent_exit_cleans_stubborn_child_and_retained_pipes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("sh");
+        command.args(["-c", "(trap '' TERM; printf ready > ready; sleep 3; touch leaked) & while [ ! -f ready ]; do sleep 0.01; done; exit 0"]).current_dir(temp.path());
+        let (_keepalive, receiver) = watch::channel(false);
+        assert_eq!(
+            execute(&state, &attempt, command, receiver, 10, None)
+                .await
+                .unwrap(),
+            0
+        );
+        let pgid = attempt.journal.lock().unwrap().pid.unwrap();
+        assert!(process_group_absent(pgid).unwrap());
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!temp.path().join("leaked").exists());
+    }
+    #[tokio::test]
+    async fn timeout_kills_stubborn_child_before_returning_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "(trap '' TERM; sleep 5; touch leaked) & wait"])
+            .current_dir(temp.path());
+        let (_keepalive, receiver) = watch::channel(false);
+        let error = execute(&state, &attempt, command, receiver, 1, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded timeout"));
+        let pgid = attempt.journal.lock().unwrap().pid.unwrap();
+        assert!(process_group_absent(pgid).unwrap());
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!temp.path().join("leaked").exists());
+    }
+    #[tokio::test]
+    async fn restarted_dead_attempt_can_be_cancelled_without_signalling_saved_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        child.wait().await.unwrap();
+        assert!(process_group_absent(pgid).unwrap());
+        attempt
+            .update(|journal| {
+                journal.pid = Some(pgid);
+                journal.report.state = "running".into();
+            })
+            .unwrap();
+        load_state(&state).await.unwrap();
+        assert_eq!(
+            state.attempts.lock().unwrap()["attempt"].report().state,
+            "unknown"
+        );
+        let mut events = state.events.subscribe();
+        request_cancel(&state, "job", "attempt").await.unwrap();
+        assert_eq!(
+            state.attempts.lock().unwrap()["attempt"].report().state,
+            "cancelled"
+        );
+        assert!(
+            matches!(events.recv().await.unwrap(), WorkerMessage::Finished { report } if report.state == "cancelled")
+        );
+        let persisted: Journal =
+            serde_json::from_reader(File::open(attempt.dir.join("journal.json")).unwrap()).unwrap();
+        assert_eq!(persisted.report.state, "cancelled");
+    }
+    #[tokio::test]
+    async fn restarted_live_group_cancel_remains_unknown_and_never_signals_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        attempt
+            .update(|journal| {
+                journal.pid = Some(pgid);
+                journal.report.state = "unknown".into();
+            })
+            .unwrap();
+        state
+            .attempts
+            .lock()
+            .unwrap()
+            .insert("attempt".into(), attempt.clone());
+        request_cancel(&state, "job", "attempt").await.unwrap();
+        assert_eq!(attempt.report().state, "unknown");
+        assert!(attempt.report().error.unwrap().contains("still exists"));
+        assert!(!process_group_absent(pgid).unwrap());
+        stop_process(&mut child, pgid, None).await.unwrap();
+    }
+    #[tokio::test]
+    async fn ready_environment_tool_drift_is_rejected_before_job_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let tool = shared.join("drift");
+        fs::write(&tool, "#!/bin/sh\nprintf '1.0.0\\n'\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut environment = Environment {
+            id: "a".into(),
+            revision: "1".into(),
+            ..Default::default()
+        };
+        environment
+            .requirements
+            .tools
+            .insert("drift".into(), "1.0.0".into());
+        environment
+            .env
+            .insert("PATH".into(), format!("{}:${{PATH}}", shared.display()));
+        prepare(&state, &environment, true).await.unwrap();
+        let mut second = Environment {
+            id: "b".into(),
+            revision: "1".into(),
+            ..Default::default()
+        };
+        second.setup.push(format!(
+            "printf '#!/bin/sh\\nprintf \"2.0.0\\\\n\"\\n' > '{}'",
+            tool.display()
+        ));
+        prepare(&state, &second, true).await.unwrap();
+        let job = Job {
+            id: "job".into(),
+            attempt_id: "attempt".into(),
+            state: "assigned".into(),
+            spec: JobSpec {
+                command: vec!["sh".into(), "-c".into(), "touch should-not-run".into()],
+                ..Default::default()
+            },
+            worker_id: None,
+            created_at: 0,
+            updated_at: 0,
+            exit_code: None,
+            error: None,
+            results: vec![],
+        };
+        let (_keepalive, receiver) = watch::channel(false);
+        let error = run_attempt(&state, &attempt, &job, Some(&environment), receiver)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("required drift 1.0.0, found 2.0.0"));
+        assert!(!attempt.dir.join("work").exists());
+        assert_eq!(state.environments.lock().unwrap()["a/1"].state, "failed");
+        assert!(fs::read_to_string(tool).unwrap().contains("2.0.0"));
+    }
+    #[tokio::test]
+    async fn image_path_is_inspected_by_immutable_id_and_cached_without_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_at(temp.path());
+        let runtime = temp.path().join("runtime");
+        fs::write(&runtime, "#!/bin/sh\nprintf '%s\\n' '[\"HOME=/root\",\"PATH=/opt/custom/bin:/usr/local/cargo/bin:/usr/bin\"]'\n").unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::get_mut(&mut state).unwrap().capabilities.runtimes =
+            vec![runtime.to_string_lossy().into()];
+        let id = format!("sha256:{}", "a".repeat(64));
+        let path = image_path(&state, &id).await.unwrap();
+        fs::remove_file(runtime).unwrap();
+        assert_eq!(image_path(&state, &id).await.unwrap(), path);
+        let mut environment = Environment::default();
+        environment
+            .env
+            .insert("PATH".into(), "${YLCC_ENV_DIR}/custom:${PATH}".into());
+        let values = expanded_env(
+            Some(&environment),
+            None,
+            Path::new("/not-the-image-home"),
+            Some(&path),
+        );
+        assert_eq!(
+            values["PATH"],
+            "/ylcc-env/custom:/ylcc-env/bin:/opt/custom/bin:/usr/local/cargo/bin:/usr/bin"
+        );
+        assert_eq!(values["HOME"], "/ylcc-env");
+    }
     #[test]
     fn identifiers_cannot_escape() {
         for value in ["", ".", "..", "a/b", "a\\b", "-x", "a b"] {
@@ -2039,7 +2561,7 @@ mod tests {
         environment
             .env
             .insert("OTHER".into(), "$(echo bad):${UNKNOWN}".into());
-        let values = expanded_env(Some(&environment), None, Path::new("/tmp/tools"), false);
+        let values = expanded_env(Some(&environment), None, Path::new("/tmp/tools"), None);
         assert!(values["PATH"].starts_with("/tmp/tools/custom:/tmp/tools/bin:"));
         assert_eq!(values["OTHER"], "$(echo bad):${UNKNOWN}");
     }

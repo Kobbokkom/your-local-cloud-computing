@@ -73,9 +73,17 @@ fn systemd_unit(args: &[String], data_dir: &Path, path: &str, role: &str) -> Res
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('%', "%%");
+    let directory = data_dir
+        .to_str()
+        .context("service data directory must be UTF-8")?;
+    checked(directory)?;
+    if !data_dir.is_absolute() || directory.trim_end() != directory {
+        bail!("service data directory must be absolute with no trailing whitespace")
+    }
+    // WorkingDirectory takes the full value, not ExecStart-style quoted arguments.
+    let directory = directory.replace('%', "%%");
     Ok(format!(
-        "[Unit]\nDescription=YLCC {role}\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={args}\nWorkingDirectory={}\nEnvironment=\"PATH={path}\"\nUMask=0077\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
-        systemd_arg(&data_dir.to_string_lossy())?.replace("$$", "$")
+        "[Unit]\nDescription=YLCC {role}\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={args}\nWorkingDirectory={directory}\nEnvironment=\"PATH={path}\"\nUMask=0077\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
     ))
 }
 
@@ -430,6 +438,59 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/a b/ylcc\" \"a\\\";$$HOME%%h\\\\x\""));
         assert!(unit.contains("Environment=\"PATH=/bin:$HOME/%%h\""));
         assert!(systemd_arg("x\nExecStart=/evil").is_err());
+    }
+    #[test]
+    fn systemd_working_directory_is_an_unquoted_absolute_value() {
+        let unit = systemd_unit(
+            &["/usr/bin/true".into()],
+            Path::new("/data dir/$cache%h"),
+            "/usr/bin:/bin",
+            "worker",
+        )
+        .unwrap();
+        assert!(unit.contains("\nWorkingDirectory=/data dir/$cache%%h\n"));
+        assert!(!unit.contains("WorkingDirectory=\""));
+        assert!(
+            systemd_unit(
+                &["/usr/bin/true".into()],
+                Path::new("relative"),
+                "/bin",
+                "worker"
+            )
+            .is_err()
+        );
+        if Command::new("systemd-analyze")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let directory = tempfile::Builder::new()
+                .prefix("ylcc service % ")
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("ylcc-worker.service");
+            fs::write(
+                &path,
+                systemd_unit(
+                    &["/usr/bin/true".into()],
+                    directory.path(),
+                    "/usr/bin:/bin",
+                    "worker",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let output = Command::new("systemd-analyze")
+                .arg("verify")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "systemd unit rejected: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
     #[test]
     fn system_supervisor_requires_an_explicit_nonroot_account() {

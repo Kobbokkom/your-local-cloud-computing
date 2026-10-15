@@ -92,6 +92,9 @@ def main():
             arch = "aarch64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
             common = ["--os", os_name, "--arch", arch]
 
+            empty, _ = cli("run", "--no-input", *common, "--", "true")
+            assert empty["state"] == "succeeded" and not empty["spec"]["inputs"]
+
             manifest, _ = cli("manifest", "--project")
             assert "ignored.txt" not in {f["path"] for f in manifest["files"]}
             assert all(not f["path"].startswith(".git/") for f in manifest["files"])
