@@ -2,3 +2,4 @@
 /.ylcc/
 *.token
 *.db
+__pycache__/

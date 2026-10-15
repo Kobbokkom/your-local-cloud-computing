@@ -1,0 +1,19 @@
+{
+  "id": "python-linux",
+  "revision": "3.13.11-bookworm-2",
+  "requirements": {
+    "os": "linux",
+    "tools": {
+      "python": "3.13.11",
+      "python3": "3.13.11"
+    }
+  },
+  "image": "docker.io/library/python:3.13.11-bookworm@sha256:b3ad23176613a34fcd715a28da314a0cbbd230dcc68798efb80ec30292b2a683",
+  "verify": [
+    "python -c 'import sys; assert sys.version_info[:3] == (3, 13, 11)'",
+    "python -m pip --version"
+  ],
+  "env": {
+    "PIP_CACHE_DIR": "${YLCC_ENV_DIR}/pip-cache"
+  }
+}

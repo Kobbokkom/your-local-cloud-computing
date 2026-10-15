@@ -1,0 +1,19 @@
+[Unit]
+Description=YLCC plain container worker
+After=network-online.target
+
+[Container]
+RunInit=true
+Image=ghcr.io/kobbokkom/your-local-cloud-computing:0.1.0
+ContainerName=ylcc-worker
+UserNS=keep-id:uid=10001,gid=10001
+Volume=ylcc-worker-data:/data
+Volume=%h/.config/ylcc/token:/run/secrets/token:ro,Z
+# Replace HUB.example.ts.net with your private HTTPS hub address.
+Exec=--hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token worker --id container-worker --data-dir /data --max-jobs 1
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
