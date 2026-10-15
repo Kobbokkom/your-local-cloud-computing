@@ -726,6 +726,7 @@ fn image_command(
     process.args([
         "run",
         "--rm",
+        "--init",
         "--name",
         name,
         "--platform",
@@ -745,7 +746,19 @@ fn image_command(
     for (source, target) in [(dir, "/workspace"), (env_dir, "/ylcc-env")] {
         let source = source.to_str().context("non-UTF8 mount path")?;
         ensure!(!source.contains(','), "container bind path contains comma");
-        process.args(["--mount", &format!("type=bind,src={source},dst={target}")]);
+        let label = if runtime == "podman" {
+            if target == "/workspace" {
+                ",relabel=private"
+            } else {
+                ",relabel=shared"
+            }
+        } else {
+            ""
+        };
+        process.args([
+            "--mount",
+            &format!("type=bind,src={source},dst={target}{label}"),
+        ]);
     }
     if let Some(gpu) = gpu {
         match (runtime, gpu) {
@@ -2177,6 +2190,38 @@ mod tests {
             image_paths: Mutex::new(HashMap::new()),
             events,
         })
+    }
+    #[test]
+    fn podman_relabels_owned_mounts_without_disabling_selinux() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_at(temp.path());
+        Arc::get_mut(&mut state).unwrap().capabilities.runtimes = vec!["podman".into()];
+        let command = image_command(
+            &state,
+            "image",
+            &["true".into()],
+            &temp.path().join("work"),
+            &temp.path().join("env"),
+            &BTreeMap::new(),
+            "test",
+            None,
+        )
+        .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|s| s == "--init"));
+        assert!(
+            args.iter()
+                .any(|s| s.ends_with("dst=/workspace,relabel=private"))
+        );
+        assert!(
+            args.iter()
+                .any(|s| s.ends_with("dst=/ylcc-env,relabel=shared"))
+        );
+        assert!(!args.iter().any(|s| s.contains("label=disable")));
     }
     fn attempt_at(data: &Path, id: &str) -> Arc<Attempt> {
         let dir = data.join("attempts").join(id);

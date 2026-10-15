@@ -8,9 +8,11 @@ services:
     secrets: [token]
     restart: unless-stopped
   worker:
+    init: true
+    network_mode: service:hub
     image: ghcr.io/kobbokkom/your-local-cloud-computing:0.1.0
     user: "${YLCC_UID:?Set YLCC_UID to id -u}:${YLCC_GID:?Set YLCC_GID to id -g}"
-    command: ["--hub", "http://hub:7443", "--token-file", "/run/secrets/token", "worker", "--id", "container-worker", "--data-dir", "/data", "--max-jobs", "1"]
+    command: ["--hub", "http://127.0.0.1:7443", "--token-file", "/run/secrets/token", "worker", "--id", "container-worker", "--data-dir", "/data", "--max-jobs", "1"]
     volumes: ["${YLCC_DATA_DIR:?Set an absolute YLCC_DATA_DIR}/worker:/data"]
     secrets: [token]
     depends_on: [hub]

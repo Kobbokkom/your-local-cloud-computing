@@ -95,11 +95,6 @@ def protected_file(path):
 
 def install_file(path, data, mode):
     checked_path(str(path))
-    if path.exists():
-        protected_file(path)
-        if path.read_bytes() != data:
-            raise ValueError("Existing service file differs; uninstall it before replacing it")
-        return
     for parent in reversed([path.parent, *path.parent.parents]):
         if not parent.exists():
             parent.mkdir(mode=0o755)
@@ -107,6 +102,11 @@ def install_file(path, data, mode):
         metadata = parent.stat()
         if metadata.st_uid != 0 or metadata.st_mode & 0o022:
             raise ValueError("Service file parents must be root-owned and not group/world writable")
+    if path.exists():
+        protected_file(path)
+        if path.read_bytes() != data:
+            raise ValueError("Existing service file differs; uninstall it before replacing it")
+        return
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as output:

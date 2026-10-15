@@ -2,3 +2,8 @@
 target
 .env
 *.log
+.ylcc
+*.token
+*.db
+__pycache__
+.env.*

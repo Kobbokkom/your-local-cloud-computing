@@ -44,16 +44,27 @@ export PATH="$HOME/.local/bin:$PATH"
 ylcc --version
 ```
 
-Use `--prefix /your/prefix` to change the install location. You can also download and check the [release archives](https://github.com/Kobbokkom/your-local-cloud-computing/releases) yourself. macOS builds are unsigned command-line programs; they are not notarized application bundles. Linux release binaries use musl; workload binaries keep their own platform/ABI requirements.
+Use `--prefix /your/prefix` to change the install location. You can also download and check the [release archives](https://github.com/Kobbokkom/your-local-cloud-computing/releases) yourself. macOS builds are unsigned command-line programs; they are not notarized application bundles. Linux release binaries require glibc 2.35 or newer so native workers can load GPU driver libraries. On musl-based systems such as Alpine, use the container image or build from source for your system; GPU probing additionally requires dynamic library loading. Workload binaries keep their own platform/ABI requirements.
 
-To build from source:
+### Download examples and agent support files
+
+The binary installer installs the executable only. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
 
 ```bash
-git clone https://github.com/Kobbokkom/your-local-cloud-computing.git
-cd your-local-cloud-computing
-cargo build --locked --release
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.0"
+mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
+git clone --depth 1 --branch v0.1.0 \
+  https://github.com/Kobbokkom/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
+```
+
+Keep this directory for the examples below. Reuse it if already cloned; it contains public support files, never your pool token. Commands reference this directory explicitly or run examples in a subshell, preserving your application's working directory.
+
+To build the CLI from this checkout instead of downloading a binary:
+
+```bash
+cargo build --manifest-path "$YLCC_SUPPORT_DIR/Cargo.toml" --locked --release
 mkdir -p "$HOME/.local/bin"
-install -m 755 target/release/ylcc "$HOME/.local/bin/ylcc"
+install -m 755 "$YLCC_SUPPORT_DIR/target/release/ylcc" "$HOME/.local/bin/ylcc"
 ```
 
 ## Quick start
@@ -99,13 +110,16 @@ ylcc --json workers
 ylcc --json doctor
 ```
 
-From a project, inspect the transfer manifest and execute the command on a matching worker:
+From the [support checkout](#download-examples-and-agent-support-files), inspect the example's transfer manifest and execute it on a matching worker:
 
 ```bash
-ylcc manifest --input examples/jobs/hello.rs
-ylcc run --input examples/jobs/hello.rs --os linux --arch x86_64 \
-  --tool rustc='*' --output result.json \
-  -- sh -c 'rustc examples/jobs/hello.rs -o hello && ./hello'
+(
+  cd "$YLCC_SUPPORT_DIR"
+  ylcc manifest --input examples/jobs/hello.rs
+  ylcc run --input examples/jobs/hello.rs --os linux --arch x86_64 \
+    --tool rustc='*' --output result.json \
+    -- sh -c 'rustc examples/jobs/hello.rs -o hello && ./hello'
+)
 ```
 
 The worker must already have `rustc` available, or use a [registered environment](#reusable-environments). `--tool NAME=VERSION` requires the reported exact version; `*` accepts any detected version. `--build-target` adds a toolchain target requirement; it does not alter your build command or install a missing SDK automatically.
@@ -142,7 +156,7 @@ sequenceDiagram
     H-->>A: Results in job-specific folder
 ```
 
-Select files/folders with repeated `--input`, or use `--project` for the whole project. Directory discovery follows Git's ignore rules, while tracked files use their current working content, including uncommitted changes. Explicitly selecting an ignored **file** includes that file only. Inspect `manifest` before including generated files or credentials. Symlinks are rejected rather than followed outside the selection.
+Select files/folders with repeated `--input`, use `--project` for the whole project, or explicitly use `--no-input` for a command requiring no local files. Directory discovery follows Git's ignore rules, while tracked files use their current working content, including uncommitted changes. Explicitly selecting an ignored **file** includes that file only. Inspect `manifest` before including generated files or credentials. Symlinks are rejected rather than followed outside the selection.
 
 Inputs are immutable after submission; changing local files affects the next submission. Each attempt gets a fresh writable checkout. Only declared relative output paths are collected. No implicit heavy local fallback, automatic retry on another worker, or cross-architecture emulation occurs. A disconnected/`unknown` attempt needs inspection before resubmission because its original process may still exist.
 
@@ -177,21 +191,21 @@ Remove the user service with `ylcc service uninstall --role worker` (or `hub`). 
 
 The worker image supports Linux amd64 and arm64. It includes YLCC, CA certificates, Git, Bash and curl; workload tools belong in reusable environments or your own image. The plain image has no runtime socket or nested container daemon.
 
-For the included Compose setup, use private loopback port forwarding for the hub and bind persistent directories owned by your current user. Preserve the token's owner-only mode:
+Using the [support checkout](#download-examples-and-agent-support-files), publish the Compose hub only on host loopback and bind persistent directories owned by your current user. The worker shares the hub's network namespace and connects over its loopback, keeping plaintext HTTP local. Preserve the token's owner-only mode:
 
 ```bash
 export YLCC_UID="$(id -u)" YLCC_GID="$(id -g)"
 export YLCC_DATA_DIR="$HOME/.local/share/ylcc/containers"
 export YLCC_TOKEN_FILE="$HOME/.config/ylcc/token"
 mkdir -p "$YLCC_DATA_DIR/hub" "$YLCC_DATA_DIR/worker"
-docker compose up -d
+docker compose -f "$YLCC_SUPPORT_DIR/compose.yaml" up -d
 ```
 
-The worker connects to the Compose hub internally. To join an existing private hub instead, run only a worker with a persistent data mount:
+The worker connects to `http://127.0.0.1:7443` inside the shared network namespace. To join an existing private hub instead, run only a worker with a persistent data mount:
 
 ```bash
 mkdir -p "$YLCC_DATA_DIR/worker"
-docker run -d --name ylcc-worker --restart unless-stopped \
+docker run -d --init --name ylcc-worker --restart unless-stopped \
   --user "$YLCC_UID:$YLCC_GID" \
   --mount "type=bind,src=$YLCC_DATA_DIR/worker,dst=/data" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
@@ -200,16 +214,17 @@ docker run -d --name ylcc-worker --restart unless-stopped \
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
 
-For rootless Podman service management, copy [the Quadlet example](examples/quadlet/ylcc-worker.container) to `~/.config/containers/systemd/`, replace the hub URL and worker ID, then `systemctl --user daemon-reload && systemctl --user start ylcc-worker`. Its keep-id mapping lets the service read your mode-600 token. See [Podman Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
+For rootless Podman service management, copy `$YLCC_SUPPORT_DIR/examples/quadlet/ylcc-worker.container` ([example](examples/quadlet/ylcc-worker.container)) to `~/.config/containers/systemd/`, replace the hub URL and worker ID, then `systemctl --user daemon-reload && systemctl --user start ylcc-worker`. Its keep-id mapping lets the service read your mode-600 token. See [Podman Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 
 ### Optional sibling-container execution
 
 Native workers can use an already configured Docker or Podman runtime. To request a workload image, pass `--container IMAGE`, or use an image environment. A containerized worker needs an explicitly installed runtime client and access to the host runtime. Build the optional client target from a matching release binary:
 
 ```bash
-mkdir -p dist
-cp /path/to/matching-linux-binary/ylcc dist/ylcc
-docker build --target runtime-client -t ylcc-runtime-client:0.1.0 .
+mkdir -p "$YLCC_SUPPORT_DIR/dist"
+cp /path/to/matching-linux-binary/ylcc "$YLCC_SUPPORT_DIR/dist/ylcc"
+docker build --target runtime-client -t ylcc-runtime-client:0.1.0 \
+  -f "$YLCC_SUPPORT_DIR/Dockerfile" "$YLCC_SUPPORT_DIR"
 ```
 
 Mount the daemon socket explicitly and add the socket's group to the worker. **This grants the worker control of that host runtime.** Bind-mount the worker data directory at the **same absolute path** on host and worker, and pass that path as `--data-dir`; sibling container mounts are resolved by the host daemon, not the worker container. This profile uses a client only, never Docker-in-Docker. Docker Desktop path sharing and rootless Podman socket permissions must also allow the chosen paths/user.
@@ -220,7 +235,7 @@ For a Docker socket, set `YLCC_RUNTIME_SOCKET` to its absolute path and `YLCC_RU
 : "${YLCC_RUNTIME_SOCKET:?Set the Docker socket path}" "${YLCC_RUNTIME_GID:?Set its numeric group ID}"
 export YLCC_RUNTIME_DATA="$HOME/.local/share/ylcc/runtime-worker"
 mkdir -p "$YLCC_RUNTIME_DATA"
-docker run -d --name ylcc-runtime-worker --restart unless-stopped \
+docker run -d --init --name ylcc-runtime-worker --restart unless-stopped \
   --user "$(id -u):$(id -g)" --group-add "$YLCC_RUNTIME_GID" \
   --mount "type=bind,src=$YLCC_RUNTIME_SOCKET,dst=/var/run/docker.sock" \
   --mount "type=bind,src=$YLCC_RUNTIME_DATA,dst=$YLCC_RUNTIME_DATA" \
@@ -234,14 +249,18 @@ Build custom workload images outside YLCC, push them to GHCR/Forgejo or another 
 
 ## Reusable environments
 
-Register and prepare Rust, Node or Python image environments from the bundled examples:
+Register and prepare Rust, Node or Python image environments from the [support checkout](#download-examples-and-agent-support-files):
 
 ```bash
-ylcc env add examples/environments/rust.json
+ylcc env add "$YLCC_SUPPORT_DIR/examples/environments/rust.json"
 ylcc env prepare rust-linux --worker linux-build
 ylcc env status
-ylcc run --input Cargo.toml --input Cargo.lock --input src --os linux --arch x86_64 \
-  --environment rust-linux --output target/release/my-tool -- cargo build --locked --release
+(
+  cd "$YLCC_SUPPORT_DIR"
+  ylcc run --input examples/jobs/hello.rs --os linux --arch x86_64 \
+    --environment rust-linux --output result.json \
+    -- sh -c 'rustc examples/jobs/hello.rs -o hello && ./hello'
+)
 ```
 
 The example image references are pinned multi-platform digests. Use [Node](examples/environments/node.json) or [Python](examples/environments/python.json) similarly. Image environments execute on a worker with a usable container runtime; Docker on macOS still runs Linux. Images are pulled and verified in the actual execution environment, and resolved digests/readiness are stored per worker.
@@ -254,12 +273,12 @@ Installing an API CLI does not authenticate it. Supply required credentials thro
 
 ## Use from an agent
 
-Install the CLI, configure the requester, and install the bundled skill globally or per project:
+Install the CLI, configure the requester, [download the support files](#download-examples-and-agent-support-files), and install the bundled skill globally or per project:
 
 ```bash
-bash scripts/install-skill.sh --global
+bash "$YLCC_SUPPORT_DIR/scripts/install-skill.sh" --global
 # Or:
-bash scripts/install-skill.sh --project /path/to/project
+bash "$YLCC_SUPPORT_DIR/scripts/install-skill.sh" --project /path/to/project
 ```
 
 Start a new agent session. For Codex, skills are discovered from `~/.agents/skills` or the project's `.agents/skills`; the included skill permits normal automatic selection. See [Codex skills](https://learn.chatgpt.com/docs/customization/overview#skills). Other agents supporting the open skill format can load [skills/ylcc/SKILL.md](skills/ylcc/SKILL.md) from their documented skill directory.
@@ -270,13 +289,16 @@ Ask naturally: “Build this on a Linux x86_64 worker and bring back the binary,
 
 Programs must actually use the requested GPU backend. `--gpu cuda`, `--gpu rocm` and `--gpu metal` select distinct capabilities; they do not translate CPU code or pool GPU memory over the network. Check `workers` and run an actual workload to validate device/driver access under the service account. Container GPU execution additionally needs the host's NVIDIA/CDI or ROCm runtime configuration.
 
-The included [CUDA driver example](examples/jobs/cuda.py) performs GPU vector addition using Python's standard library and an installed NVIDIA driver. The [Metal example](examples/jobs/metal.swift) dispatches a Metal compute kernel:
+From the [support checkout](#download-examples-and-agent-support-files), the [CUDA driver example](examples/jobs/cuda.py) performs GPU vector addition using Python's standard library and an installed NVIDIA driver. The [Metal example](examples/jobs/metal.swift) dispatches a Metal compute kernel:
 
 ```bash
-ylcc run --input examples/jobs/cuda.py --os linux --arch x86_64 --gpu cuda \
-  --output result.json -- python3 examples/jobs/cuda.py
-ylcc run --input examples/jobs/metal.swift --os macos --arch aarch64 --gpu metal \
-  --output result.json -- swift examples/jobs/metal.swift
+(
+  cd "$YLCC_SUPPORT_DIR"
+  ylcc run --input examples/jobs/cuda.py --os linux --arch x86_64 --gpu cuda \
+    --output result.json -- python3 examples/jobs/cuda.py
+  ylcc run --input examples/jobs/metal.swift --os macos --arch aarch64 --gpu metal \
+    --output result.json -- swift examples/jobs/metal.swift
+)
 ```
 
 macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.1.0.
@@ -286,9 +308,12 @@ macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requestin
 `ylcc doctor` reports local capabilities and configured workers. Check service logs, actual service-account `PATH`, token permissions, private HTTPS reachability and container runtime access first. A worker connection loss is distinct from command failure. Persist the hub database/blob directory and worker data; do not delete an unknown attempt's files while its process may still be running.
 
 ```bash
-cargo test --locked
-bash scripts/test-install.sh
-cargo build --locked --release
+(
+  cd "$YLCC_SUPPORT_DIR"
+  cargo test --locked
+  bash scripts/test-install.sh
+  cargo build --locked --release
+)
 ```
 
 CI builds/tests on native Linux x86_64, Linux arm64, Intel macOS and Apple Silicon macOS. Release automation creates four archives, checksums, a multi-platform image and a draft GitHub Release for final real-machine validation. Published release availability and successful local hardware tests are separate checks.

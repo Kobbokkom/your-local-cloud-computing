@@ -10,6 +10,14 @@ spec.loader.exec_module(storage)
 
 
 class StorageSafety(unittest.TestCase):
+    def test_identical_existing_helper_cannot_bypass_parent_trust(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp).resolve() / "helper.py"
+            destination.write_bytes(b"same")
+            with patch.object(storage, "protected_file"):
+                with self.assertRaises(ValueError):
+                    storage.install_file(destination, b"same", 0o755)
+
     def test_refuses_noncanonical_or_symlink_path(self):
         for value in ("/", "relative", "/a/../b", "/a//b", "/a\nb"):
             with self.assertRaises(ValueError):

@@ -15,6 +15,19 @@ case "$version" in v[0-9]*) ;; *) printf 'Expected a release tag such as v0.1.0\
 [[ "$version" != *[!a-zA-Z0-9._-]* ]] || { printf 'Invalid release tag\n' >&2; exit 1; }
 case "$(uname -s)" in Linux) os=linux ;; Darwin) os=macos ;; *) printf 'Supported systems: Linux and macOS\n' >&2; exit 1 ;; esac
 case "$(uname -m)" in x86_64|amd64) arch=x86_64 ;; arm64|aarch64) arch=aarch64 ;; *) printf 'Supported architectures: x86_64 and arm64\n' >&2; exit 1 ;; esac
+if [[ "$os" == linux ]]; then
+  libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  loader="$(ldd --version 2>&1 || true)"
+  if [[ "$loader" == *musl* || ! "$libc" =~ ^glibc[[:space:]]+([0-9]+)\.([0-9]+) ]]; then
+    printf 'Prebuilt Linux binaries require glibc 2.35+; musl or an unidentified libc is unsupported. Use the container image or build from source for your system.\n' >&2
+    exit 1
+  fi
+  libc_major="${BASH_REMATCH[1]}" libc_minor="${BASH_REMATCH[2]}"
+  if ((10#$libc_major < 2 || (10#$libc_major == 2 && 10#$libc_minor < 35))); then
+    printf 'Prebuilt Linux binaries require glibc 2.35+ (detected %s). Use the container image or build from source for your system.\n' "$libc" >&2
+    exit 1
+  fi
+fi
 command -v curl >/dev/null || { printf 'curl is required\n' >&2; exit 1; }
 archive="ylcc-${os}-${arch}.tar.gz"
 base="https://github.com/Kobbokkom/your-local-cloud-computing/releases/download/${version}"

@@ -1,8 +1,18 @@
 {
   "id": "node-linux",
-  "revision": "22.22.0-bookworm-1",
-  "requirements": { "os": "linux" },
+  "revision": "22.22.0-bookworm-2",
+  "requirements": {
+    "os": "linux",
+    "tools": {
+      "node": "22.22.0"
+    }
+  },
   "image": "docker.io/library/node:22.22.0-bookworm@sha256:20a424ecd1d2064a44e12fe287bf3dae443aab31dc5e0c0cb6c74bef9c78911c",
-  "verify": ["node -e 'if (process.version !== \"v22.22.0\") process.exit(1)'", "npm --version"],
-  "env": { "npm_config_cache": "${YLCC_ENV_DIR}/npm-cache" }
+  "verify": [
+    "node -e 'if (process.version !== \"v22.22.0\") process.exit(1)'",
+    "npm --version"
+  ],
+  "env": {
+    "npm_config_cache": "${YLCC_ENV_DIR}/npm-cache"
+  }
 }
