@@ -1,0 +1,9 @@
+{
+  "id": "rust-native",
+  "revision": "1.96.0-1",
+  "setup": [
+    "curl --fail --location --proto '=https' --tlsv1.2 https://sh.rustup.rs -o \"$YLCC_ENV_DIR/rustup-init.sh\" && sh \"$YLCC_ENV_DIR/rustup-init.sh\" -y --no-modify-path --profile minimal --default-toolchain 1.96.0"
+  ],
+  "verify": ["rustc --version | grep '^rustc 1.96.0 '", "cargo --version"],
+  "env": { "CARGO_HOME": "${YLCC_ENV_DIR}", "RUSTUP_HOME": "${YLCC_ENV_DIR}/rustup" }
+}

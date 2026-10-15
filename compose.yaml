@@ -1,0 +1,20 @@
+services:
+  hub:
+    image: ghcr.io/kobbokkom/your-local-cloud-computing:0.1.0
+    user: "${YLCC_UID:?Set YLCC_UID to id -u}:${YLCC_GID:?Set YLCC_GID to id -g}"
+    command: ["--token-file", "/run/secrets/token", "hub", "--listen", "0.0.0.0:7443", "--data-dir", "/data"]
+    ports: ["127.0.0.1:7443:7443"]
+    volumes: ["${YLCC_DATA_DIR:?Set an absolute YLCC_DATA_DIR}/hub:/data"]
+    secrets: [token]
+    restart: unless-stopped
+  worker:
+    image: ghcr.io/kobbokkom/your-local-cloud-computing:0.1.0
+    user: "${YLCC_UID:?Set YLCC_UID to id -u}:${YLCC_GID:?Set YLCC_GID to id -g}"
+    command: ["--hub", "http://hub:7443", "--token-file", "/run/secrets/token", "worker", "--id", "container-worker", "--data-dir", "/data", "--max-jobs", "1"]
+    volumes: ["${YLCC_DATA_DIR:?Set an absolute YLCC_DATA_DIR}/worker:/data"]
+    secrets: [token]
+    depends_on: [hub]
+    restart: unless-stopped
+secrets:
+  token:
+    file: ${YLCC_TOKEN_FILE:?Set YLCC_TOKEN_FILE to an existing readable token file}

@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust stable
+        run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: python3 tests/e2e.py target/debug/ylcc
+      - run: cargo build --locked --release
+      - run: bash scripts/test-install.sh
+      - name: CLI smoke test
+        run: target/release/ylcc --help && target/release/ylcc --version

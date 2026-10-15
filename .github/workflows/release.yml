@@ -1,0 +1,131 @@
+name: Release
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            os: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            os: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 -c 'import os,tomllib; assert os.environ["RELEASE_TAG"] == "v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"], "release tag must match Cargo.toml"'
+      - name: Rust stable
+        run: rustup update stable --no-self-update && rustup default stable && rustup target add '${{ matrix.target }}'
+      - name: Native Linux musl compiler
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Test and build on the target architecture
+        env:
+          CC: ${{ matrix.os == 'linux' && 'musl-gcc' || 'clang' }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: |
+          cargo test --locked --target '${{ matrix.target }}'
+          cargo build --locked --release --target '${{ matrix.target }}'
+          python3 tests/e2e.py 'target/${{ matrix.target }}/release/ylcc'
+          bash scripts/test-install.sh
+          mkdir -p dist
+          cp 'target/${{ matrix.target }}/release/ylcc' dist/ylcc
+          dist/ylcc --version
+          tar -czf 'ylcc-${{ matrix.os }}-${{ matrix.arch }}.tar.gz' -C dist ylcc
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ylcc-${{ matrix.os }}-${{ matrix.arch }}
+          path: ylcc-*.tar.gz
+          if-no-files-found: error
+  image:
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            platform: amd64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            platform: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ylcc-linux-${{ matrix.arch }}
+      - name: Prepare tested binary
+        run: mkdir -p dist && tar -xzf 'ylcc-linux-${{ matrix.arch }}.tar.gz' -C dist
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/${{ matrix.platform }}
+          push: true
+          tags: ghcr.io/kobbokkom/your-local-cloud-computing:sha-${{ github.sha }}-${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/Kobbokkom/your-local-cloud-computing
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+  publish:
+    needs: [build, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: ylcc-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable-version image manifest and draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+          docker buildx imagetools create -t "ghcr.io/kobbokkom/your-local-cloud-computing:$version" \
+            'ghcr.io/kobbokkom/your-local-cloud-computing:sha-${{ github.sha }}-amd64' \
+            'ghcr.io/kobbokkom/your-local-cloud-computing:sha-${{ github.sha }}-arm64'
+          (cd dist && sha256sum ylcc-*.tar.gz > SHA256SUMS)
+          gh release create "$RELEASE_TAG" dist/ylcc-*.tar.gz dist/SHA256SUMS \
+            --draft --verify-tag --title "$RELEASE_TAG" --generate-notes
