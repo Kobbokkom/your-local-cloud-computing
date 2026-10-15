@@ -185,6 +185,16 @@ sudo /absolute/path/to/ylcc --hub https://HUB.example.ts.net:10000 \
 
 Service installation captures the current executable location and native user's `PATH`; keep the binary there. System-user macOS installs set a user-specific `HOME` and a standard tool path. After changing tool paths, reinstall the service and verify capabilities under the service account. Updates should wait until active jobs finish before restarting a worker. Never replace running environments mid-job.
 
+An external Mac volume with “Ignore ownership” enabled cannot enforce a dedicated account's mode-600 token. The optional storage helper creates a thin APFS image with ownership enabled, leaving the parent volume's settings intact:
+
+```bash
+sudo mkdir -p /Volumes/YourSSD/ylcc
+sudo python3 "$YLCC_SUPPORT_DIR/scripts/macos-storage.py" init \
+  --image /Volumes/YourSSD/ylcc/storage.sparsebundle --mountpoint /Volumes/YLCC --size 64g
+```
+
+Place the dedicated account's home, token and worker data inside that mount before installing its worker service. The helper installs `org.ylcc.storage` to retry mounting if the SSD is absent at startup. After unplugging an already mounted SSD, reconnect it and run `sudo launchctl kickstart system/org.ylcc.storage`; then restart the worker after the mount is ready. Remove the mount service with the same helper's `uninstall-service` command and the same image/mountpoint arguments. It retains the disk image and data.
+
 Remove the user service with `ylcc service uninstall --role worker` (or `hub`). This retains tokens and workload data; remove those explicitly only when no longer needed. System-user LaunchDaemon removal uses `service uninstall --role worker --system-user SERVICE_USER` as an administrator.
 
 ## Docker and Podman

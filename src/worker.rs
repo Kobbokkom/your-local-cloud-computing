@@ -821,6 +821,11 @@ fn process_group_absent(pgid: u32) -> Result<bool> {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(true);
         }
+        // Darwin reports EPERM for zombie-only groups until they are reaped; this is not absence.
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) {
+            return Ok(false);
+        }
         Err(error).context("cannot inspect process group")
     }
     #[cfg(not(unix))]
@@ -832,7 +837,9 @@ fn signal_group(pgid: u32, signal: i32) -> Result<()> {
     {
         if unsafe { libc::kill(-(pgid as i32), signal) } != 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
+            if error.raw_os_error() != Some(libc::ESRCH)
+                && !(cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
+            {
                 return Err(error).context("signal process group");
             }
         }
@@ -2161,7 +2168,10 @@ mod tests {
         let hash = "a".repeat(64);
         let expected = format!("sha256:{hash}");
         assert_eq!(normalize_image_id(&hash).unwrap(), expected);
-        assert_eq!(normalize_image_id(&format!("{expected}\n")).unwrap(), expected);
+        assert_eq!(
+            normalize_image_id(&format!("{expected}\n")).unwrap(),
+            expected
+        );
         for invalid in ["", "short", "sha512:abc", &"A".repeat(64)] {
             assert!(normalize_image_id(invalid).is_err());
         }
@@ -2346,6 +2356,29 @@ mod tests {
             fs::read(temp.path().join("blobs").join(hash)).unwrap(),
             b"original"
         );
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cleanup_waits_for_zombie_group_without_claiming_absence() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            if unsafe { libc::kill(-(pgid as i32), 0) } != 0 {
+                break std::io::Error::last_os_error();
+            }
+            assert!(tokio::time::Instant::now() < deadline, "child did not exit");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let absent_before_reaping = process_group_absent(pgid);
+        let cleanup = stop_process(&mut child, pgid, None).await;
+        child.wait().await.unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert!(!absent_before_reaping.unwrap());
+        cleanup.unwrap();
+        assert!(process_group_absent(pgid).unwrap());
     }
     #[tokio::test]
     async fn cancellation_stops_descendants_and_preserves_logs() {

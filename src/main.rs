@@ -102,7 +102,11 @@ struct RunArgs {
     abi: Option<String>,
     #[arg(long)]
     gpu: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "NAME=VERSION",
+        help = "Require an exact tool version, or NAME=* for any detected version"
+    )]
     tool: Vec<String>,
     #[arg(long)]
     cpu_feature: Vec<String>,
