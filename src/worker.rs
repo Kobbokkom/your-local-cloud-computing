@@ -228,11 +228,13 @@ pub async fn run(
     let token = crate::client::read_token(&token_file)?;
     private_dir(&data_dir)?;
     let data = fs::canonicalize(data_dir)?;
+    let lock_path = data.join("worker.lock");
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(data.join("worker.lock"))?;
+        .open(&lock_path)
+        .with_context(|| format!("open worker lock file {}", lock_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
