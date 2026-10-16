@@ -121,7 +121,7 @@ Docker's restart policy manages the worker while the Windows container engine is
 
 ## Windows CLI and worker
 
-Windows support is new in the source checkout. Published **v0.2.0 has no Windows binary**; use a checkout containing this support until a Windows release is published. Native Windows x86_64 is supported; Windows arm64 release artifacts and a Windows Hub background service are not provided. The Hub can stay on Linux/macOS. Windows uses the same outward HTTPS/WebSocket connection and shared token; SSH, WSL and Docker are not required.
+Windows support is new in the source checkout. Published **v0.2.0 has no Windows binary**; use a checkout containing this support until a Windows release is published. Native Windows x86_64 is supported; Windows arm64 release artifacts and a Windows Hub background service are not provided. The Hub can stay on Linux/macOS, but update it from this support checkout before connecting a Windows worker: the v0.2.0 Hub rejects Windows worker registrations. Windows uses the same outward HTTPS/WebSocket connection and shared token; SSH, WSL and Docker are not required.
 
 To build from source, install [Rust's MSVC toolchain](https://rust-lang.org/tools/install/) and Visual Studio Build Tools with the C++ desktop workload and Windows SDK (SQLite is bundled). In PowerShell, from this checkout:
 

@@ -637,7 +637,7 @@ impl Store {
         if max_jobs == 0 || max_jobs > 256 {
             bail!("max_jobs must be between 1 and 256")
         }
-        if !matches!(capabilities.os.as_str(), "linux" | "macos") {
+        if !matches!(capabilities.os.as_str(), "linux" | "macos" | "windows") {
             bail!("unsupported worker OS")
         }
         capabilities.arch = normalize_arch(&capabilities.arch);
@@ -1737,6 +1737,55 @@ mod tests {
         assert!(data.join("hub.sqlite").is_file());
     }
 
+    #[test]
+    fn windows_workers_register_and_receive_matching_jobs_but_unknown_os_is_rejected() {
+        let (_dir, mut store) = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = store
+            .connect(
+                "unknown".into(),
+                Capabilities {
+                    os: "unknown".into(),
+                    ..caps()
+                },
+                1,
+                vec![],
+                vec![],
+                tx,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported worker OS"));
+        assert!(store.workers().unwrap().is_empty());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        store
+            .connect(
+                "windows".into(),
+                Capabilities {
+                    os: "windows".into(),
+                    abi: "msvc".into(),
+                    ..caps()
+                },
+                1,
+                vec![],
+                vec![],
+                tx,
+            )
+            .unwrap();
+        let job = store
+            .add_job(JobSpec {
+                requirements: Requirements {
+                    os: Some("windows".into()),
+                    arch: Some("x86_64".into()),
+                    ..Default::default()
+                },
+                ..spec()
+            })
+            .unwrap_or_else(|e| panic!("{}", e.1));
+        assert_eq!(job.worker_id.as_deref(), Some("windows"));
+        assert_eq!(job.state, "assigned");
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+    }
     #[test]
     fn queues_busy_worker_and_rejects_incompatible_platform() {
         let (_dir, mut store) = test_store();
