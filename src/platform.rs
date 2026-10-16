@@ -448,7 +448,10 @@ mod windows {
             std::io::Error::last_os_error()
         );
         let handle = unsafe { File::from_raw_handle(handle) };
-        owned(&handle)?;
+        protect_acl(&handle)
+    }
+    fn protect_acl(file: &File) -> Result<()> {
+        owned(file)?;
         let descriptor = descriptor()?;
         let mut present = 0;
         let mut defaulted = 0;
@@ -462,7 +465,7 @@ mod windows {
         );
         let code = unsafe {
             SetSecurityInfo(
-                handle.as_raw_handle(),
+                file.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 null_mut(),
@@ -476,7 +479,7 @@ mod windows {
             "protect file ACL: {}",
             std::io::Error::from_raw_os_error(code as i32)
         );
-        check_private(&handle)
+        check_private(file)
     }
     pub(super) fn private_dir(path: &Path) -> Result<()> {
         if let Some(parent) = path
@@ -504,7 +507,8 @@ mod windows {
             file.metadata()?.is_dir() && !is_link(&file.metadata()?),
             "private directory must not be a reparse point"
         );
-        protect_file(&file)
+        // The directory handle already has ACL access; ReOpenFile rejects this directory handle.
+        protect_acl(&file)
     }
     pub(super) fn create_private_file(path: &Path) -> Result<File> {
         let descriptor = descriptor()?;
@@ -577,6 +581,25 @@ mod tests {
         drop(file);
         read_private_file(&path).unwrap();
         assert!(create_private_file(&path).is_err());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn private_directories_preserve_data_and_protect_acl_on_reuse() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private");
+        private_dir(&path).unwrap();
+        fs::write(path.join("keep"), "data").unwrap();
+        private_dir(&path).unwrap();
+        let file = OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&path)
+            .unwrap();
+        windows::check_private(&file).unwrap();
+        assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "data");
     }
     #[test]
     fn replacement_updates_existing_file() {
