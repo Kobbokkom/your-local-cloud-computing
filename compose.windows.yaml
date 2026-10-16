@@ -5,6 +5,9 @@ services:
     platform: windows/amd64
     isolation: ${YLCC_WINDOWS_ISOLATION:-hyperv}
     user: ContainerUser
+    dns:
+      - ${YLCC_WINDOWS_DNS_PRIMARY:-}
+      - ${YLCC_WINDOWS_DNS_FALLBACK:-}
     command:
       - --hub
       - ${YLCC_HUB_URL:?Set the private HTTPS Hub URL}
