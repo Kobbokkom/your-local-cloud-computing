@@ -742,11 +742,11 @@ mod tests {
         assert_eq!(absolute_path(&current).unwrap(), current);
     }
 
-    fn test_token() -> tempfile::NamedTempFile {
+    fn test_token() -> tempfile::TempPath {
         let mut token = tempfile::NamedTempFile::new().unwrap();
         platform::protect_file(token.as_file()).unwrap();
         writeln!(token, "{}", "a".repeat(64)).unwrap();
-        token
+        token.into_temp_path()
     }
 
     #[tokio::test]
@@ -759,7 +759,7 @@ mod tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let token = test_token();
-        let value = diagnostics(&hub, token.path(), Capabilities::default())
+        let value = diagnostics(&hub, &token, Capabilities::default())
             .await
             .unwrap();
         server.abort();
@@ -787,7 +787,7 @@ mod tests {
             );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let token = test_token();
-        let client = Client::new(&hub, token.path()).unwrap();
+        let client = Client::new(&hub, &token).unwrap();
         let snap = snapshot::Snapshot {
             files: vec![],
             excluded: vec![],
