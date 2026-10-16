@@ -93,14 +93,20 @@ docker build --file Dockerfile.windows --target runtime --tag ylcc-windows:local
 $env:YLCC_WINDOWS_IMAGE = 'ylcc-windows:local'
 ```
 
-Use a **dedicated named volume** for worker jobs, environments and the protected token copy. Transfer your existing pool token through the secure administration channel into a private host directory as `pool.token`. Set `$bootstrap` to that directory; the initializer mounts it read-only for this one-time operation. The initializer derives the image's ContainerUser identity, protects only the fixed YLCC volume paths, and refuses to replace a different existing token. It never changes the host token's ACL or prints its contents.
+Use a **dedicated named volume** for worker jobs, environments and the protected token copy. Transfer your existing pool token through the secure administration channel into a private host directory as `pool.token`. Set `$bootstrap` to that directory; the initializer mounts it read-only for this one-time operation. Discover the image's actual unprivileged ContainerUser identity before initialization; the initializer protects only the fixed YLCC volume paths and refuses to replace a different existing token. It never changes the host token's ACL or prints its contents.
 
 ```powershell
 $env:YLCC_WINDOWS_DATA_VOLUME = 'ylcc-windows-worker'
 $env:YLCC_WINDOWS_ISOLATION = 'hyperv'  # Choose a supported mode for your host.
 $bootstrap = 'C:\path\to\private-token-folder'
+$identityProbe = '$ProgressPreference="SilentlyContinue"; $i=[Security.Principal.WindowsIdentity]::GetCurrent(); @{sid=$i.User.Value; name=$i.Name; admin=(New-Object Security.Principal.WindowsPrincipal($i)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)} | ConvertTo-Json -Compress'
+$encodedIdentity = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($identityProbe))
+$workerIdentity = docker run --rm --isolation $env:YLCC_WINDOWS_ISOLATION --user ContainerUser --entrypoint powershell.exe $env:YLCC_WINDOWS_IMAGE -NoProfile -NonInteractive -EncodedCommand $encodedIdentity
+if ($LASTEXITCODE -ne 0) { throw 'Cannot discover the image ContainerUser identity.' }
+$workerIdentity = $workerIdentity | Out-String | ConvertFrom-Json
+if ($workerIdentity.admin -ne $false -or $workerIdentity.name -notmatch '(^|\\)ContainerUser$') { throw 'Expected the unprivileged ContainerUser identity.' }
 docker volume create $env:YLCC_WINDOWS_DATA_VOLUME
-docker run --rm --isolation $env:YLCC_WINDOWS_ISOLATION --user ContainerAdministrator --mount "type=volume,source=$env:YLCC_WINDOWS_DATA_VOLUME,target=C:\ylcc-data" --mount "type=bind,source=$bootstrap,target=C:\ylcc-bootstrap,readonly" --entrypoint powershell.exe $env:YLCC_WINDOWS_IMAGE -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\ylcc\Initialize-WindowsWorker.ps1
+docker run --rm --isolation $env:YLCC_WINDOWS_ISOLATION --user ContainerAdministrator --mount "type=volume,source=$env:YLCC_WINDOWS_DATA_VOLUME,target=C:\ylcc-data" --mount "type=bind,source=$bootstrap,target=C:\ylcc-bootstrap,readonly" --entrypoint powershell.exe $env:YLCC_WINDOWS_IMAGE -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\ylcc\Initialize-WindowsWorker.ps1 -WorkerSid $workerIdentity.sid
 ```
 
 The initializer is the only step run as ContainerAdministrator. The ongoing worker runs as **ContainerUser** using only the named volume. Its private directories/token allow ContainerUser, SYSTEM and built-in Administrators; they are owned by the built-in Administrators group. No host secret directory is mounted into the ongoing worker. Source snapshots, writable attempts, logs, environment caches and returned files persist under `C:\ylcc-data\worker` when the container is recreated.

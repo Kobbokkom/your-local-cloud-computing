@@ -23,9 +23,21 @@ try {
     & $Binary --token-file (Join-Path $bootstrap 'pool.token') init
     if ($LASTEXITCODE -ne 0) { throw 'Failed to create the disposable test pool token.' }
     $originalTokenHash = (Get-FileHash -LiteralPath (Join-Path $bootstrap 'pool.token') -Algorithm SHA256).Hash
+    $identityProbe = '$ProgressPreference="SilentlyContinue"; $i=[Security.Principal.WindowsIdentity]::GetCurrent(); @{sid=$i.User.Value; name=$i.Name; admin=(New-Object Security.Principal.WindowsPrincipal($i)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)} | ConvertTo-Json -Compress'
+    $encodedIdentity = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($identityProbe))
+    $workerIdentity = & docker run --rm --isolation=process --user ContainerUser --entrypoint powershell.exe $RuntimeImage -NoProfile -NonInteractive -EncodedCommand $encodedIdentity
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot discover the runtime ContainerUser identity.' }
+    $workerIdentity = $workerIdentity | Out-String | ConvertFrom-Json
+    if ($workerIdentity.admin -ne $false -or $workerIdentity.name -notmatch '(^|\\)ContainerUser$') { throw 'The runtime did not provide an unprivileged ContainerUser identity.' }
+    $workerSid = $workerIdentity.sid
     Invoke-Docker -Arguments @('volume', 'create', $volume)
     $mounts = @('--mount', "type=volume,source=$volume,target=C:\ylcc-data")
-    $initialize = @('run', '--rm', '--isolation=process', '--user', 'ContainerAdministrator') + $mounts + @('--mount', "type=bind,source=$bootstrap,target=C:\ylcc-bootstrap,readonly", '--entrypoint', 'powershell.exe', $RuntimeImage, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'C:\ylcc\Initialize-WindowsWorker.ps1')
+    $initialize = @('run', '--rm', '--isolation=process', '--user', 'ContainerAdministrator') + $mounts + @('--mount', "type=bind,source=$bootstrap,target=C:\ylcc-bootstrap,readonly", '--entrypoint', 'powershell.exe', $RuntimeImage, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'C:\ylcc\Initialize-WindowsWorker.ps1', '-WorkerSid', $workerSid)
+    foreach ($unsafeSid in @('S-1-1-0', 'S-1-5-18')) {
+        $unsafeInitialize = $initialize.Clone()
+        $unsafeInitialize[-1] = $unsafeSid
+        Invoke-Docker -Arguments $unsafeInitialize -ExpectFailure
+    }
     Invoke-Docker -Arguments $initialize
     Invoke-Docker -Arguments $initialize # Same-token initialization must preserve an existing volume.
     Invoke-Docker -Arguments (@('run', '--rm', '--isolation=process') + $mounts + @($Image))

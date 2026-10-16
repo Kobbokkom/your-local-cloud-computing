@@ -1,11 +1,20 @@
 # One-time initialization of a dedicated Windows worker volume; never the steady-state entrypoint.
 [CmdletBinding()]
-param([string]$SourceToken = 'C:\ylcc-bootstrap\pool.token')
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^S-1-[0-9]+(?:-[0-9]+)+$')]
+    [string]$WorkerSid,
+    [string]$SourceToken = 'C:\ylcc-bootstrap\pool.token'
+)
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this one-time initializer as ContainerAdministrator.' }
-$containerUser = (New-Object Security.Principal.NTAccount('ContainerUser')).Translate([Security.Principal.SecurityIdentifier])
+$containerUser = New-Object Security.Principal.SecurityIdentifier($WorkerSid)
+if ($containerUser.Equals($identity.User)) { throw 'WorkerSid must identify the unprivileged ContainerUser, not the initializer account.' }
+foreach ($kind in @('LocalSystemSid', 'BuiltinAdministratorsSid', 'WorldSid', 'AnonymousSid', 'AuthenticatedUserSid', 'BuiltinUsersSid')) {
+    if ($containerUser.IsWellKnown([Security.Principal.WellKnownSidType]::$kind)) { throw 'WorkerSid must identify the unprivileged ContainerUser, not a privileged account or shared group.' }
+}
 $system = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
 $admins = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
 $root = 'C:\ylcc-data'
