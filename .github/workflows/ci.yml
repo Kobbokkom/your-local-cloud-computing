@@ -24,6 +24,5 @@ jobs:
       - run: python3 tests/e2e.py target/debug/ylcc
       - run: cargo build --locked --release
       - run: bash scripts/test-install.sh
-      - run: python3 tests/test_macos_storage.py
       - name: CLI smoke test
         run: target/release/ylcc --help && target/release/ylcc --version

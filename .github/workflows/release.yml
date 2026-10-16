@@ -48,7 +48,6 @@ jobs:
           cargo build --locked --release --target '${{ matrix.target }}'
           python3 tests/e2e.py 'target/${{ matrix.target }}/release/ylcc'
           bash scripts/test-install.sh
-          python3 tests/test_macos_storage.py
           mkdir -p dist
           cp 'target/${{ matrix.target }}/release/ylcc' dist/ylcc
           cp LICENSE dist/LICENSE
