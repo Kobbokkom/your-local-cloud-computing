@@ -60,7 +60,7 @@ jobs:
           path: ylcc-*.tar.gz
           if-no-files-found: error
   build-windows:
-    runs-on: windows-2025
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust stable
@@ -86,7 +86,7 @@ jobs:
       - run: python tests/e2e.py target/x86_64-pc-windows-msvc/release/ylcc.exe
       - name: Windows PowerShell 5.1 installer checks
         shell: powershell
-        run: ./scripts/test-install.ps1
+        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./scripts/test-install.ps1
       - name: Package the tested Windows binary
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
@@ -141,8 +141,45 @@ jobs:
             org.opencontainers.image.source=https://github.com/semanticist21/your-local-cloud-computing
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
+  image-windows:
+    needs: build-windows
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Windows container daemon preflight
+        run: |
+          docker version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dockerOS = docker info --format '{{.OSType}}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($dockerOS -ne 'windows') { throw 'This job requires a Windows container Docker engine.' }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ylcc-windows-x86_64
+      - name: Prepare the tested Windows binary
+        run: Expand-Archive -LiteralPath ylcc-windows-x86_64.zip -DestinationPath dist
+      - name: Build Windows Server Core runtime and CI image
+        run: |
+          docker build --isolation=process --file Dockerfile.windows --target runtime --tag ylcc-windows:runtime .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker build --isolation=process --file Dockerfile.windows --target test --tag ylcc-windows:test .
+      - name: Verify Windows ContainerUser jobs and persistent volume
+        shell: powershell
+        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./scripts/test-windows-image.ps1
+      - name: Publish the tested Windows image by source revision
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $env:GH_TOKEN | docker login ghcr.io --username '${{ github.actor }}' --password-stdin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker tag ylcc-windows:runtime ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-windows-ltsc2022
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker push ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-windows-ltsc2022
   publish:
-    needs: [build, build-windows, image]
+    needs: [build, build-windows, image, image-windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -170,6 +207,8 @@ jobs:
           docker buildx imagetools create -t "ghcr.io/semanticist21/your-local-cloud-computing:$version" \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-amd64' \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-arm64'
+          docker buildx imagetools create --prefer-index=false -t "ghcr.io/semanticist21/your-local-cloud-computing:$version-windows-ltsc2022" \
+            'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-windows-ltsc2022'
           (cd dist && sha256sum ylcc-*.tar.gz ylcc-*.zip > SHA256SUMS)
           gh release create "$RELEASE_TAG" dist/ylcc-*.tar.gz dist/ylcc-*.zip dist/SHA256SUMS \
             --draft --verify-tag --title "$RELEASE_TAG" --generate-notes

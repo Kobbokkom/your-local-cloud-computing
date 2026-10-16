@@ -1,0 +1,20 @@
+# escape=`
+# Server Core provides Windows PowerShell 5.1; this is a Windows/amd64 image.
+FROM mcr.microsoft.com/windows/servercore:ltsc2022@sha256:593cf4a5ef08cfff00a03637e45eba073b8fe9dc90b80af4449bc5f427c7cdcd AS runtime
+SHELL ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+COPY dist/ylcc.exe C:/ylcc/ylcc.exe
+COPY dist/LICENSE dist/THIRD_PARTY_NOTICES.txt C:/ylcc/licenses/
+COPY scripts/Initialize-WindowsWorker.ps1 C:/ylcc/Initialize-WindowsWorker.ps1
+ENV YLCC_CONTAINERIZED=1
+WORKDIR C:/ylcc
+USER ContainerUser
+ENTRYPOINT ["C:\\ylcc\\ylcc.exe"]
+CMD ["--help"]
+
+# CI-only layer; the shipped runtime does not contain test fixtures.
+FROM runtime AS test
+COPY scripts/test-windows-container.ps1 C:/ylcc/test-windows-container.ps1
+ENTRYPOINT ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "C:\\ylcc\\test-windows-container.ps1"]
+CMD []
+
+FROM runtime AS final

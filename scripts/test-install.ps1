@@ -1,7 +1,50 @@
 # Offline installation checks. Run with Windows PowerShell 5.1 or PowerShell 7 on Windows.
 [CmdletBinding()]
-param([string]$Installer = (Join-Path $PSScriptRoot 'install.ps1'))
+param(
+    [string]$Installer = (Join-Path $PSScriptRoot 'install.ps1'),
+    [switch]$SkipExecutionPolicyCheck
+)
 $ErrorActionPreference = 'Stop'
+if (-not $SkipExecutionPolicyCheck) {
+    # Reproduce a Restricted client without changing any persistent policy scope.
+    $policyTemp = Join-Path ([IO.Path]::GetTempPath()) ('ylcc-policy-test-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($policyTemp) | Out-Null
+    $probe = Join-Path $policyTemp 'unsigned probe.ps1'
+    $marker = Join-Path $policyTemp 'executed'
+    [IO.File]::WriteAllText($probe, "[IO.File]::WriteAllText('" + $marker.Replace("'", "''") + "', 'executed')")
+    $restrictedCommand = @'
+$ErrorActionPreference = 'Stop'
+if ((Get-ExecutionPolicy -Scope Process) -ne 'Restricted') { throw 'Restricted parent was not established.' }
+$before = Get-ExecutionPolicy -List | Where-Object { $_.Scope -ne 'Process' } | ConvertTo-Json -Compress
+$ErrorActionPreference = 'Continue'
+& (Join-Path $PSHOME 'powershell.exe') -NoProfile -NonInteractive -File __PROBE__ 2>$null
+$blockedCode = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($blockedCode -eq 0 -or (Test-Path -LiteralPath __MARKER__)) { throw 'Restricted parent allowed an unsigned script without child Bypass.' }
+& (Join-Path $PSHOME 'powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File __TEST__ -Installer __INSTALLER__ -SkipExecutionPolicyCheck
+if ($LASTEXITCODE -ne 0) { throw 'Child-process Bypass installer checks failed.' }
+if ((Get-ExecutionPolicy -Scope Process) -ne 'Restricted') { throw 'The child changed its parent process policy.' }
+$after = Get-ExecutionPolicy -List | Where-Object { $_.Scope -ne 'Process' } | ConvertTo-Json -Compress
+if ($before -cne $after) { throw 'A persistent execution policy scope changed.' }
+Write-Host 'Restricted-parent check passed: only the child process used Bypass; persistent policies are unchanged.'
+'@
+    foreach ($replacement in @{
+        '__PROBE__' = $probe
+        '__MARKER__' = $marker
+        '__TEST__' = $PSCommandPath
+        '__INSTALLER__' = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Installer)
+    }.GetEnumerator()) {
+        $restrictedCommand = $restrictedCommand.Replace($replacement.Key, "'" + $replacement.Value.Replace("'", "''") + "'")
+    }
+    try {
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($restrictedCommand))
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Restricted -EncodedCommand $encoded
+        if ($LASTEXITCODE -ne 0) { throw 'Restricted-parent installation checks failed.' }
+    } finally { Remove-Item -LiteralPath $policyTemp -Recurse -Force }
+    return
+}
+if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') { throw 'Installer checks require process-local Bypass.' }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $taskTemp = Join-Path ([IO.Path]::GetTempPath()) ('ylcc-install-test-' + [Guid]::NewGuid().ToString('N'))
 $release = Join-Path $taskTemp 'release'
