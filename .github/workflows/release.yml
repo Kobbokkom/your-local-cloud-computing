@@ -94,9 +94,9 @@ jobs:
           target: runtime
           platforms: linux/${{ matrix.platform }}
           push: true
-          tags: ghcr.io/kobbokkom/your-local-cloud-computing:sha-${{ github.sha }}-${{ matrix.platform }}
+          tags: ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-${{ matrix.platform }}
           labels: |
-            org.opencontainers.image.source=https://github.com/Kobbokkom/your-local-cloud-computing
+            org.opencontainers.image.source=https://github.com/semanticist21/your-local-cloud-computing
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
   publish:
@@ -125,9 +125,9 @@ jobs:
         run: |
           test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
           version="${RELEASE_TAG#v}"
-          docker buildx imagetools create -t "ghcr.io/kobbokkom/your-local-cloud-computing:$version" \
-            'ghcr.io/kobbokkom/your-local-cloud-computing:sha-${{ github.sha }}-amd64' \
-            'ghcr.io/kobbokkom/your-local-cloud-computing:sha-${{ github.sha }}-arm64'
+          docker buildx imagetools create -t "ghcr.io/semanticist21/your-local-cloud-computing:$version" \
+            'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-amd64' \
+            'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-arm64'
           (cd dist && sha256sum ylcc-*.tar.gz > SHA256SUMS)
           gh release create "$RELEASE_TAG" dist/ylcc-*.tar.gz dist/SHA256SUMS \
             --draft --verify-tag --title "$RELEASE_TAG" --generate-notes
