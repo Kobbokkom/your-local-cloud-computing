@@ -16,15 +16,15 @@ use windows_sys::Win32::{
         },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOB_OBJECT_QUERY, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-            JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
-            SetInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
+            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         SystemInformation::{
             GlobalMemoryStatusEx, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
             MEMORYSTATUSEX,
         },
+        SystemServices::JOB_OBJECT_QUERY,
         Threading::{
             CREATE_SUSPENDED, GetCurrentProcess, IsWow64Process2, OpenThread, ResumeThread,
             THREAD_SUSPEND_RESUME,

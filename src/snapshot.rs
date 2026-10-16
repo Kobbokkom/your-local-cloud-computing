@@ -434,6 +434,20 @@ mod tests {
         assert_eq!(s.files[0].path, "src/a");
     }
     #[test]
+    #[cfg(unix)]
+    fn unix_snapshots_keep_names_reserved_only_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["aux.txt", "con/part.rs", "logs/2026-10-16T11:22:33.log"] {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, name).unwrap();
+        }
+        let snapshot = create(dir.path(), &[], true).unwrap();
+        for name in ["aux.txt", "con/part.rs", "logs/2026-10-16T11:22:33.log"] {
+            assert!(snapshot.files.iter().any(|file| file.path == name));
+        }
+    }
+    #[test]
     fn initialized_submodules_include_dirty_untracked_and_nested_sources() {
         let temp = tempfile::tempdir().unwrap();
         let leaf = temp.path().join("leaf");

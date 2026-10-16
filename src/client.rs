@@ -136,7 +136,7 @@ impl Client {
         let dest = results_root.join(&job.id);
         snapshot::ensure_safe_directory(&dest)?;
         for f in &job.results {
-            safe_relative(&f.path)?;
+            platform::filesystem_relative(&f.path)?;
             validate_hash(&f.hash)?;
             let target = dest.join(&f.path);
             snapshot::ensure_safe_directory(target.parent().context("result has no parent")?)?;
@@ -183,7 +183,10 @@ impl Client {
 }
 pub fn segment(s: &str) -> Result<()> {
     safe_relative(s)?;
-    if s.contains('/') {
+    if !s
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
         bail!("expected one path segment")
     };
     Ok(())
@@ -198,5 +201,18 @@ mod tests {
         assert!(validate_hub("https://example.test:10000").is_ok());
         assert!(validate_hub("http://example.test").is_err());
         assert!(validate_hub("https://a:b@example.test").is_err());
+    }
+    #[test]
+    fn route_segments_cannot_change_the_url() {
+        for name in [
+            "job?other",
+            "job#fragment",
+            "job/other",
+            "job:other",
+            "../job",
+        ] {
+            assert!(segment(name).is_err());
+        }
+        assert!(segment("job-1_a.b").is_ok());
     }
 }

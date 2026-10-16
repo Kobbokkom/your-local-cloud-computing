@@ -300,14 +300,12 @@ impl Store {
             }
         }
         for path in &paths {
-            let mut ancestor = std::path::Path::new(path).parent();
+            let mut ancestor = path.rsplit_once('/').map(|(parent, _)| parent);
             while let Some(parent) = ancestor {
-                if let Some(parent) = parent.to_str()
-                    && paths.contains(parent)
-                {
+                if paths.contains(parent) {
                     bail!("input file also used as a directory: {parent}")
                 }
-                ancestor = parent.parent();
+                ancestor = parent.rsplit_once('/').map(|(ancestor, _)| ancestor);
             }
         }
         Ok(())
@@ -1188,10 +1186,8 @@ async fn upsert_environment(
             ));
         }
     }
-    if environment.env.keys().any(|key| {
-        key.is_empty() || key.contains('=') || key.contains('\0') || key.starts_with("YLCC_")
-    }) {
-        return Err(invalid("invalid or reserved environment variable"));
+    for key in environment.env.keys() {
+        validate_env_key(key).map_err(invalid)?;
     }
     let mut store = lock(&state)?;
     if let Some(previous) = store.environment_revision(&environment.id, &environment.revision)?
@@ -1392,6 +1388,48 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalogue_rejects_reserved_environment_keys_in_every_case() {
+        let (_dir, store) = test_store();
+        let state = Arc::new(Mutex::new(store));
+        for key in [
+            "",
+            "YLCC_JOB_ID",
+            "ylcc_job_id",
+            "YlCc_attempt_id",
+            "bad=name",
+            "bad\0name",
+        ] {
+            let environment = Environment {
+                id: "native".into(),
+                revision: "v1".into(),
+                requirements: Requirements::default(),
+                setup: vec![],
+                verify: vec![],
+                image: None,
+                env: BTreeMap::from([(key.into(), "value".into())]),
+            };
+            let error = upsert_environment(State(state.clone()), Json(environment))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let environment = Environment {
+            id: "native".into(),
+            revision: "v1".into(),
+            requirements: Requirements::default(),
+            setup: vec![],
+            verify: vec![],
+            image: None,
+            env: BTreeMap::from([("PATH".into(), "tools".into())]),
+        };
+        assert!(
+            upsert_environment(State(state), Json(environment))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

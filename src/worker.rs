@@ -78,7 +78,7 @@ fn identifier(value: &str) -> Result<()> {
                 .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
         "invalid identifier"
     );
-    safe_relative(value)?;
+    crate::platform::filesystem_relative(value)?;
     Ok(())
 }
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -1054,7 +1054,7 @@ async fn stop_process(
                 .kill_on_drop(true);
             let _ = tokio::time::timeout(Duration::from_secs(15), cleanup.status()).await;
             ensure!(
-                container_absent(runtime, name).await?,
+                Box::pin(container_absent(runtime, name)).await?,
                 "container {name} remains after cleanup"
             );
         }
@@ -1181,6 +1181,17 @@ async fn run_attempt(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(i32, Vec<FileEntry>)> {
     cancelled(&cancel)?;
+    for path in job
+        .spec
+        .inputs
+        .iter()
+        .map(|input| input.path.as_str())
+        .chain(job.spec.outputs.iter().map(String::as_str))
+    {
+        crate::platform::filesystem_relative(path)?;
+    }
+    #[cfg(windows)]
+    validate_windows_inputs(&job.spec.inputs)?;
     if let Some(environment) = environment {
         ensure!(
             environment.image.is_some() || job.spec.container.is_none(),
@@ -1247,8 +1258,6 @@ async fn run_attempt(
     }
     let workdir = attempt.dir.join("work");
     fs::create_dir(&workdir).context("create fresh attempt checkout")?;
-    #[cfg(windows)]
-    validate_windows_inputs(&job.spec.inputs)?;
     for input in &job.spec.inputs {
         cancelled(&cancel)?;
         let blob = ensure_blob(state, &input.hash, Some(input.size)).await?;

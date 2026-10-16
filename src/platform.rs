@@ -37,8 +37,15 @@ pub fn relative_path(path: &Path) -> Result<String> {
         parts.push(part.to_str().context("path is not UTF-8")?);
     }
     let path = parts.join("/");
-    crate::model::safe_relative(&path)?;
+    filesystem_relative(&path)?;
     Ok(path)
+}
+
+pub fn filesystem_relative(path: &str) -> Result<()> {
+    crate::model::safe_relative(path)?;
+    #[cfg(windows)]
+    crate::model::windows_relative(path)?;
+    Ok(())
 }
 
 pub fn is_link(metadata: &Metadata) -> bool {
@@ -396,7 +403,7 @@ mod windows {
                 "read token ACE"
             );
             let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-            if header.AceFlags & INHERIT_ONLY_ACE != 0 || header.AceType == 1 {
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 || header.AceType == 1 {
                 continue;
             }
             ensure!(
@@ -553,6 +560,14 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_filesystem_rules_follow_the_host() {
+        for path in ["aux.txt", "con/part.rs", "logs/2026-10-16T11:22:33.log"] {
+            assert_eq!(filesystem_relative(path).is_err(), cfg!(windows));
+            assert_eq!(relative_path(Path::new(path)).is_err(), cfg!(windows));
+        }
+        assert!(filesystem_relative("../escape").is_err());
+    }
     #[test]
     fn private_files_refuse_replacement_and_retain_private_access() {
         let dir = tempfile::tempdir().unwrap();
