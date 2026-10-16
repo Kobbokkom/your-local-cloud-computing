@@ -78,6 +78,7 @@ struct WorkerSettings {
 }
 
 fn identifier(value: &str) -> Result<()> {
+    safe_relative(value)?;
     if value.is_empty()
         || value.len() > 128
         || !value.as_bytes()[0].is_ascii_alphanumeric()
@@ -299,14 +300,12 @@ impl Store {
             }
         }
         for path in &paths {
-            let mut ancestor = std::path::Path::new(path).parent();
+            let mut ancestor = path.rsplit_once('/').map(|(parent, _)| parent);
             while let Some(parent) = ancestor {
-                if let Some(parent) = parent.to_str()
-                    && paths.contains(parent)
-                {
+                if paths.contains(parent) {
                     bail!("input file also used as a directory: {parent}")
                 }
-                ancestor = parent.parent();
+                ancestor = parent.rsplit_once('/').map(|(ancestor, _)| ancestor);
             }
         }
         Ok(())
@@ -638,7 +637,7 @@ impl Store {
         if max_jobs == 0 || max_jobs > 256 {
             bail!("max_jobs must be between 1 and 256")
         }
-        if !matches!(capabilities.os.as_str(), "linux" | "macos") {
+        if !matches!(capabilities.os.as_str(), "linux" | "macos" | "windows") {
             bail!("unsupported worker OS")
         }
         capabilities.arch = normalize_arch(&capabilities.arch);
@@ -898,10 +897,7 @@ fn incompatibilities(
 }
 
 pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Result<()> {
-    let token = std::fs::read_to_string(token_file)?.trim().to_owned();
-    if token.len() < 16 || token.chars().any(char::is_whitespace) {
-        bail!("token file must contain one token of at least 16 characters")
-    }
+    let token = crate::client::read_token(&token_file)?;
     let state = Arc::new(Mutex::new(Store::open(data_dir, token)?));
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -1190,10 +1186,8 @@ async fn upsert_environment(
             ));
         }
     }
-    if environment.env.keys().any(|key| {
-        key.is_empty() || key.contains('=') || key.contains('\0') || key.starts_with("YLCC_")
-    }) {
-        return Err(invalid("invalid or reserved environment variable"));
+    for key in environment.env.keys() {
+        validate_env_key(key).map_err(invalid)?;
     }
     let mut store = lock(&state)?;
     if let Some(previous) = store.environment_revision(&environment.id, &environment.revision)?
@@ -1394,6 +1388,48 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalogue_rejects_reserved_environment_keys_in_every_case() {
+        let (_dir, store) = test_store();
+        let state = Arc::new(Mutex::new(store));
+        for key in [
+            "",
+            "YLCC_JOB_ID",
+            "ylcc_job_id",
+            "YlCc_attempt_id",
+            "bad=name",
+            "bad\0name",
+        ] {
+            let environment = Environment {
+                id: "native".into(),
+                revision: "v1".into(),
+                requirements: Requirements::default(),
+                setup: vec![],
+                verify: vec![],
+                image: None,
+                env: BTreeMap::from([(key.into(), "value".into())]),
+            };
+            let error = upsert_environment(State(state.clone()), Json(environment))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let environment = Environment {
+            id: "native".into(),
+            revision: "v1".into(),
+            requirements: Requirements::default(),
+            setup: vec![],
+            verify: vec![],
+            image: None,
+            env: BTreeMap::from([("PATH".into(), "tools".into())]),
+        };
+        assert!(
+            upsert_environment(State(state), Json(environment))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1701,6 +1737,55 @@ mod tests {
         assert!(data.join("hub.sqlite").is_file());
     }
 
+    #[test]
+    fn windows_workers_register_and_receive_matching_jobs_but_unknown_os_is_rejected() {
+        let (_dir, mut store) = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = store
+            .connect(
+                "unknown".into(),
+                Capabilities {
+                    os: "unknown".into(),
+                    ..caps()
+                },
+                1,
+                vec![],
+                vec![],
+                tx,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported worker OS"));
+        assert!(store.workers().unwrap().is_empty());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        store
+            .connect(
+                "windows".into(),
+                Capabilities {
+                    os: "windows".into(),
+                    abi: "msvc".into(),
+                    ..caps()
+                },
+                1,
+                vec![],
+                vec![],
+                tx,
+            )
+            .unwrap();
+        let job = store
+            .add_job(JobSpec {
+                requirements: Requirements {
+                    os: Some("windows".into()),
+                    arch: Some("x86_64".into()),
+                    ..Default::default()
+                },
+                ..spec()
+            })
+            .unwrap_or_else(|e| panic!("{}", e.1));
+        assert_eq!(job.worker_id.as_deref(), Some("windows"));
+        assert_eq!(job.state, "assigned");
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+    }
     #[test]
     fn queues_busy_worker_and_rejects_incompatible_platform() {
         let (_dir, mut store) = test_store();

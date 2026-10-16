@@ -1,4 +1,4 @@
-use crate::{model::*, snapshot};
+use crate::{model::*, platform, snapshot};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -67,9 +67,11 @@ fn strict_requirements<'de, D: serde::Deserializer<'de>>(
 
 impl Project {
     pub fn load(file: &Path) -> Result<(Self, PathBuf)> {
-        let file = file
-            .canonicalize()
-            .with_context(|| format!("project file {}", file.display()))?;
+        let file = platform::command_path(
+            &file
+                .canonicalize()
+                .with_context(|| format!("project file {}", file.display()))?,
+        );
         let project = Self::parse(&fs::read_to_string(&file)?)?;
         let root = file
             .parent()
@@ -107,7 +109,7 @@ impl Task {
         for input in &self.inputs {
             let input = input.to_str().context("input path is not UTF-8")?;
             if input != "." {
-                safe_relative(input)?;
+                platform::relative_path(Path::new(input))?;
             }
         }
         self.spec(Vec::new()).validate()
@@ -200,7 +202,10 @@ mod tests {
         )
         .unwrap();
         let (project, resolved_root) = Project::load(&root.join("ylcc.yaml")).unwrap();
-        assert_eq!(resolved_root, root.canonicalize().unwrap());
+        assert_eq!(
+            resolved_root,
+            platform::command_path(&root.canonicalize().unwrap())
+        );
         let snapshot = project.tasks["check"].snapshot(&resolved_root).unwrap();
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].path, "source.txt");

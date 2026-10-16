@@ -1,4 +1,7 @@
 use crate::model::*;
+#[cfg(windows)]
+#[path = "worker_windows.rs"]
+mod windows;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,8 @@ struct Journal {
     container: Option<String>,
     #[serde(default)]
     runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_job: Option<String>,
 }
 struct Attempt {
     dir: PathBuf,
@@ -73,51 +78,26 @@ fn identifier(value: &str) -> Result<()> {
                 .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
         "invalid identifier"
     );
+    crate::platform::filesystem_relative(value)?;
     Ok(())
 }
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp)?;
+    let mut file = crate::platform::create_private_file(&tmp)?;
     serde_json::to_writer(&mut file, value)?;
     file.sync_all()?;
-    fs::rename(&tmp, path)?;
+    drop(file);
+    crate::platform::replace_file(&tmp, path)?;
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        crate::platform::sync_directory(parent)?;
     }
     Ok(())
 }
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("create private directory {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("inspect private directory {}", path.display()))?;
-        ensure!(
-            metadata.is_dir(),
-            "private path must be a directory: {}",
-            path.display()
-        );
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() },
-            "private directory must belong to the worker user: {}",
-            path.display()
-        );
-        if metadata.mode() & 0o7777 != 0o700 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("set private directory permissions {}", path.display()))?;
-        }
-    }
-    Ok(())
+    crate::platform::private_dir(path)
+        .with_context(|| format!("create private directory {}", path.display()))
 }
+
 impl Attempt {
     fn report(&self) -> AttemptReport {
         self.journal.lock().unwrap().report.clone()
@@ -243,19 +223,23 @@ pub async fn run(
     crate::client::validate_hub(&hub)?;
     let token = crate::client::read_token(&token_file)?;
     private_dir(&data_dir)?;
-    let data = fs::canonicalize(data_dir)?;
+    let data = crate::platform::command_path(&fs::canonicalize(data_dir)?);
     let lock_path = data.join("worker.lock");
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
+    let mut lock_options = OpenOptions::new();
+    lock_options.create(true).truncate(false).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        lock_options.share_mode(0);
+    }
+    let _lock_file = lock_options
         .open(&lock_path)
         .with_context(|| format!("open worker lock file {}", lock_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
         ensure!(
-            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            unsafe { libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another worker is using this data directory"
         );
     }
@@ -589,6 +573,7 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
         pid: None,
         container: None,
         runtime: None,
+        windows_job: None,
     };
     atomic_json(&dir.join("journal.json"), &journal)?;
     atomic_json(&dir.join("job.json"), &job.spec)?;
@@ -617,6 +602,7 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
                 journal.pid = None;
                 journal.container = None;
                 journal.runtime = None;
+                journal.windows_job = None;
             }
             match result {
                 Ok((exit, outputs)) => {
@@ -649,6 +635,28 @@ fn cancelled(cancel: &watch::Receiver<bool>) -> Result<()> {
     ensure!(!*cancel.borrow(), "job cancelled");
     Ok(())
 }
+
+#[cfg(any(windows, test))]
+fn validate_windows_inputs(inputs: &[FileEntry]) -> Result<()> {
+    let mut spellings = BTreeMap::new();
+    for input in inputs {
+        let mut prefix = String::new();
+        for component in input.path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if let Some(previous) = spellings.insert(prefix.to_uppercase(), prefix.clone()) {
+                ensure!(
+                    previous == prefix,
+                    "input paths collide on Windows: {previous} and {prefix}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn expanded_env(
     environment: Option<&Environment>,
     job: Option<&JobSpec>,
@@ -665,12 +673,13 @@ fn expanded_env(
         .map(str::to_owned)
         .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let mut values = BTreeMap::new();
+    let separator = if cfg!(windows) && !image { ';' } else { ':' };
     values.insert(
         "PATH".into(),
         if base_path.is_empty() {
             format!("{env_dir}/bin")
         } else {
-            format!("{env_dir}/bin:{base_path}")
+            format!("{env_dir}/bin{separator}{base_path}")
         },
     );
     if image {
@@ -840,6 +849,7 @@ async fn pipe_logs(
     }
     Ok(())
 }
+#[cfg(unix)]
 fn process_group_absent(pgid: u32) -> Result<bool> {
     ensure!(
         pgid > 1 && pgid <= i32::MAX as u32,
@@ -864,6 +874,7 @@ fn process_group_absent(pgid: u32) -> Result<bool> {
     #[cfg(not(unix))]
     bail!("process group inspection requires Unix")
 }
+#[cfg(unix)]
 fn signal_group(pgid: u32, signal: i32) -> Result<()> {
     ensure!(pgid > 1 && pgid <= i32::MAX as u32, "invalid process group");
     #[cfg(unix)]
@@ -918,8 +929,16 @@ async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> R
         return Ok(());
     }
     let evidence = async {
-        let pgid = journal.pid.context("no process-group evidence was saved; fence the original execution before resolving this attempt")?;
-        ensure!(process_group_absent(pgid)?, "saved process group {pgid} still exists; inspect/fence the original execution and retry cancel (saved PIDs are never signalled after restart)");
+        #[cfg(unix)]
+        {
+            let pgid = journal.pid.context("no process-group evidence was saved; fence the original execution before resolving this attempt")?;
+            ensure!(process_group_absent(pgid)?, "saved process group {pgid} still exists; inspect/fence the original execution and retry cancel (saved PIDs are never signalled after restart)");
+        }
+        #[cfg(windows)]
+        {
+            let name = journal.windows_job.as_deref().context("no Windows job evidence was saved; fence the original execution before resolving this attempt")?;
+            ensure!(windows::absent(name)?, "saved Windows job still has active processes; inspect/fence the original execution and retry cancel (saved PIDs are never signalled after restart)");
+        }
         if let Some(name) = &journal.container {
             let runtime = journal.runtime.as_deref().context("container runtime was not saved; inspect/fence the original container before resolving this attempt")?;
             ensure!(container_absent(runtime, name).await?, "container {name} still exists; stop/remove the original container and retry cancel");
@@ -930,12 +949,12 @@ async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> R
         Ok(()) => {
             journal.report.state = "cancelled".into();
             journal.report.error = Some(
-                "cancelled after confirming the original process group and container are absent"
-                    .into(),
+                "cancelled after confirming the original execution and container are absent".into(),
             );
             journal.pid = None;
             journal.container = None;
             journal.runtime = None;
+            journal.windows_job = None;
         }
         Err(error) => {
             journal.report.state = "unknown".into();
@@ -945,6 +964,7 @@ async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> R
     state.emit(WorkerMessage::Finished { report });
     Ok(())
 }
+#[cfg(unix)]
 async fn stop_process(
     child: &mut tokio::process::Child,
     pgid: u32,
@@ -1002,6 +1022,52 @@ async fn stop_process(
         )))
     })
 }
+#[cfg(windows)]
+async fn stop_process(
+    child: &mut tokio::process::Child,
+    job: &windows::Job,
+    container: Option<(&str, &str)>,
+) -> Result<()> {
+    let execution = async {
+        job.terminate()?;
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .context("command process did not stop")??;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while job.active()? != 0 {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Windows job still has active descendants after termination"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let container_result = async {
+        if let Some((runtime, name)) = container {
+            let mut cleanup = Command::new(runtime);
+            cleanup
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let _ = tokio::time::timeout(Duration::from_secs(15), cleanup.status()).await;
+            ensure!(
+                Box::pin(container_absent(runtime, name)).await?,
+                "container {name} remains after cleanup"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    execution.and(container_result).map_err(|error| {
+        anyhow::Error::new(UncertainCleanup(format!(
+            "execution cleanup could not be confirmed: {error:#}"
+        )))
+    })
+}
+
 async fn execute(
     state: &Arc<State>,
     attempt: &Arc<Attempt>,
@@ -1020,16 +1086,36 @@ async fn execute(
     {
         command.process_group(0);
     }
+    #[cfg(unix)]
     let mut child = command.spawn().context("start command")?;
+    #[cfg(windows)]
+    let (mut child, windows_job, suspended_thread) = windows::spawn(&mut command).await?;
     let pgid = child.id().context("spawned process has no PID")?;
     if let Err(error) = attempt.update(|journal| {
         journal.pid = Some(pgid);
         journal.container = container.as_ref().map(|(_, name)| name.clone());
         journal.runtime = container.as_ref().map(|(runtime, _)| runtime.clone());
+        #[cfg(windows)]
+        {
+            journal.windows_job = Some(windows_job.name.clone());
+        }
     }) {
         stop_process(
             &mut child,
+            #[cfg(unix)]
             pgid,
+            #[cfg(windows)]
+            &windows_job,
+            container.as_ref().map(|(r, n)| (r.as_str(), n.as_str())),
+        )
+        .await?;
+        return Err(error);
+    }
+    #[cfg(windows)]
+    if let Err(error) = suspended_thread.resume() {
+        stop_process(
+            &mut child,
+            &windows_job,
             container.as_ref().map(|(r, n)| (r.as_str(), n.as_str())),
         )
         .await?;
@@ -1054,7 +1140,10 @@ async fn execute(
     };
     let cleanup = stop_process(
         &mut child,
+        #[cfg(unix)]
         pgid,
+        #[cfg(windows)]
+        &windows_job,
         container.as_ref().map(|(r, n)| (r.as_str(), n.as_str())),
     )
     .await;
@@ -1092,6 +1181,17 @@ async fn run_attempt(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(i32, Vec<FileEntry>)> {
     cancelled(&cancel)?;
+    for path in job
+        .spec
+        .inputs
+        .iter()
+        .map(|input| input.path.as_str())
+        .chain(job.spec.outputs.iter().map(String::as_str))
+    {
+        crate::platform::filesystem_relative(path)?;
+    }
+    #[cfg(windows)]
+    validate_windows_inputs(&job.spec.inputs)?;
     if let Some(environment) = environment {
         ensure!(
             environment.image.is_some() || job.spec.container.is_none(),
@@ -1165,12 +1265,9 @@ async fn run_attempt(
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(blob, &dest)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dest, fs::Permissions::from_mode(input.mode & 0o777))?;
-        }
+        let mut destination = crate::platform::create_private_file(&dest)?;
+        std::io::copy(&mut File::open(blob)?, &mut destination)?;
+        crate::platform::set_mode(&destination, input.mode)?;
     }
     let path = if let Some(image) = &image {
         Some(image_path(state, image).await?)
@@ -1416,7 +1513,7 @@ async fn ensure_blob(state: &State, hash: &str, size: Option<u64>) -> Result<Pat
 fn verify_file(path: &Path, expected: &str, size: Option<u64>) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
+        metadata.is_file() && !crate::platform::is_link(&metadata),
         "blob is not a regular file"
     );
     ensure!(
@@ -1459,12 +1556,12 @@ fn collect_output(
     result: &mut BTreeMap<String, FileEntry>,
 ) -> Result<()> {
     let relative = path.strip_prefix(root)?;
-    safe_relative(relative.to_str().context("non-UTF8 output path")?)?;
+    let wire_path = crate::platform::relative_path(relative)?;
     let mut cursor = root.to_path_buf();
     for part in relative.components() {
         cursor.push(part);
         ensure!(
-            !fs::symlink_metadata(&cursor)?.file_type().is_symlink(),
+            !crate::platform::is_link(&fs::symlink_metadata(&cursor)?),
             "output contains symlink: {}",
             relative.display()
         );
@@ -1480,14 +1577,8 @@ fn collect_output(
         }
     } else {
         ensure!(metadata.is_file(), "output is not a regular file");
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode() & 0o777
-        };
-        #[cfg(not(unix))]
-        let mode = 0o644;
-        let path_string = relative.to_str().unwrap().to_owned();
+        let mode = crate::platform::mode(&metadata);
+        let path_string = wire_path;
         result.insert(
             path_string.clone(),
             FileEntry {
@@ -1507,9 +1598,45 @@ async fn capture(mut command: Command) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(not(windows))]
     let output = tokio::time::timeout(Duration::from_secs(30), command.output())
         .await
         .context("probe timed out")??;
+    #[cfg(windows)]
+    let output = {
+        let (mut child, job, thread) = windows::spawn(&mut command).await?;
+        if let Err(error) = thread.resume() {
+            stop_process(&mut child, &job, None).await?;
+            return Err(error);
+        }
+        let stdout = child.stdout.take().context("probe stdout unavailable")?;
+        let stderr = child.stderr.take().context("probe stderr unavailable")?;
+        let read_pipe = |mut pipe: tokio::process::ChildStdout| async move {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let stdout = tokio::spawn(read_pipe(stdout));
+        let stderr = tokio::spawn(async move {
+            let mut pipe = stderr;
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        let cleanup = stop_process(&mut child, &job, None).await;
+        cleanup?;
+        let pipes = tokio::time::timeout(Duration::from_secs(5), async {
+            Ok::<_, anyhow::Error>((stdout.await??, stderr.await??))
+        })
+        .await
+        .context("probe descendants retained output pipes")??;
+        std::process::Output {
+            status: status.context("probe timed out")??,
+            stdout: pipes.0,
+            stderr: pipes.1,
+        }
+    };
     ensure!(
         output.status.success(),
         "probe failed: {}",
@@ -1522,12 +1649,28 @@ async fn capture(mut command: Command) -> Result<String> {
         Ok(stdout.trim().into())
     }
 }
+
+fn native_recipe(script: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+        command.arg(format!("$ErrorActionPreference = 'Stop'; & {{ {script}\n}}; if (-not $?) {{ exit 1 }}; if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }}"));
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("sh");
+        command.args(["-eu", "-c", script]);
+        command
+    }
+}
 fn version_token(value: &str) -> String {
     value
         .split_whitespace()
         .map(|word| {
             word.trim_start_matches('v')
-                .trim_matches(|c: char| c == '(' || c == ')' || c == ',')
+                .trim_matches(|c: char| c == '(' || c == ')' || c == ',' || c == '"')
         })
         .find(|word| word.chars().next().is_some_and(|c| c.is_ascii_digit()) && word.contains('.'))
         .unwrap_or(value.lines().next().unwrap_or(""))
@@ -1560,10 +1703,10 @@ async fn tool_version(
                 .all(|b| b.is_ascii_alphanumeric() || b"_+.-".contains(&b)),
         "invalid tool executable name"
     );
-    let arg = if tool == "xcodebuild" {
-        "-version"
-    } else {
-        "--version"
+    let arg = match tool {
+        "xcodebuild" | "java" | "javac" | "emulator" => "-version",
+        "adb" => "version",
+        _ => "--version",
     };
     let command = if let Some((state, image, workdir, envdir)) = image {
         image_command(
@@ -1577,8 +1720,28 @@ async fn tool_version(
             None,
         )?
     } else {
-        let mut process = Command::new(tool);
-        process.arg(arg).envs(values);
+        let executable = if cfg!(windows) {
+            match tool {
+                "npm" => "npm.cmd",
+                "gradle" => "gradle.bat",
+                _ => tool,
+            }
+        } else {
+            tool
+        };
+        let mut process = Command::new(executable);
+        if tool == "powershell" {
+            process.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ]);
+        } else {
+            process.arg(arg);
+        }
+        process.envs(values);
         process
     };
     let text = capture(command).await?;
@@ -1643,7 +1806,9 @@ async fn verify_tools(
         } else {
             let dir = tempfile::tempdir()?;
             let source = dir.path().join("probe.rs");
-            let binary = dir.path().join("probe");
+            let binary = dir
+                .path()
+                .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
             fs::write(&source, "fn main() {}\n")?;
             let mut compiler = Command::new("rustc");
             compiler.arg(source).arg("-o").arg(&binary).envs(values);
@@ -1703,6 +1868,7 @@ fn environment_logger(state: &State, environment: &Environment) -> Result<Arc<At
             pid: None,
             container: None,
             runtime: None,
+            windows_job: None,
         }),
     }))
 }
@@ -1765,11 +1931,8 @@ async fn verify_environment(
             container = Some((runtime(state)?.into(), name));
             command
         } else {
-            let mut command = Command::new("sh");
-            command
-                .args(["-eu", "-c", script])
-                .current_dir(&dir)
-                .envs(&values);
+            let mut command = native_recipe(script);
+            command.current_dir(&dir).envs(&values);
             command
         };
         let result = execute(state, logger, command, receiver, 600, container).await;
@@ -1875,7 +2038,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
             let values = expanded_env(Some(environment), None, &dir, None);
             for script in &environment.setup {
                 logger.log(state, "system", "preparing environment\n".into())?;
-                let mut command = Command::new("sh"); command.args(["-eu", "-c", script]).current_dir(&dir).envs(&values);
+                let mut command = native_recipe(script); command.current_dir(&dir).envs(&values);
                 let (cancel, receiver) = watch::channel(false);
                 let exit = execute(state, &logger, command, receiver, 3600, None).await?; drop(cancel); ensure!(exit == 0, "environment setup failed");
             }
@@ -1899,14 +2062,23 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
 pub async fn probe() -> Result<Capabilities> {
     let os = std::env::consts::OS.to_owned();
     let arch = normalize_arch(std::env::consts::ARCH);
-    let mut uname = Command::new("uname");
-    uname.arg("-m");
-    if let Ok(kernel_arch) = capture(uname).await {
-        ensure!(
-            normalize_arch(&kernel_arch) == arch,
-            "worker binary runs under architecture translation; install the native {} binary",
-            normalize_arch(&kernel_arch)
-        );
+    #[cfg(windows)]
+    ensure!(
+        windows::native_arch()? == arch,
+        "worker binary runs under architecture translation; install the native {} binary",
+        windows::native_arch()?
+    );
+    #[cfg(unix)]
+    {
+        let mut uname = Command::new("uname");
+        uname.arg("-m");
+        if let Ok(kernel_arch) = capture(uname).await {
+            ensure!(
+                normalize_arch(&kernel_arch) == arch,
+                "worker binary runs under architecture translation; install the native {} binary",
+                normalize_arch(&kernel_arch)
+            );
+        }
     }
     if os == "macos" {
         let mut translated = Command::new("sysctl");
@@ -1918,6 +2090,8 @@ pub async fn probe() -> Result<Capabilities> {
     }
     let abi = if os == "macos" {
         "darwin"
+    } else if os == "windows" {
+        "msvc"
     } else {
         // A static musl YLCC binary can run workloads on a glibc host.
         let mut getconf = Command::new("getconf");
@@ -1950,6 +2124,13 @@ pub async fn probe() -> Result<Capabilities> {
         "docker",
         "podman",
         "nvcc",
+        "java",
+        "javac",
+        "gradle",
+        "adb",
+        "emulator",
+        "powershell",
+        "python",
     ] {
         if let Ok(version) = tool_version(name, &values, None).await {
             tools.insert(name.into(), version);
@@ -1962,7 +2143,9 @@ pub async fn probe() -> Result<Capabilities> {
         && let Ok(dir) = tempfile::tempdir()
     {
         let source = dir.path().join("probe.rs");
-        let binary = dir.path().join("probe");
+        let binary = dir
+            .path()
+            .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
         if fs::write(&source, "fn main() {}\n").is_ok() {
             let mut compiler = Command::new("rustc");
             compiler.arg(&source).arg("-o").arg(&binary);
@@ -2036,6 +2219,9 @@ pub async fn probe() -> Result<Capabilities> {
     }
     cpu_features.sort();
     cpu_features.dedup();
+    #[cfg(windows)]
+    let memory_bytes = windows::memory_bytes()?;
+    #[cfg(not(windows))]
     let memory_bytes = if os == "linux" {
         fs::read_to_string("/proc/meminfo")
             .unwrap_or_default()
@@ -2231,7 +2417,7 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             let root = fs::metadata("/").unwrap();
             let error = private_dir(Path::new("/")).unwrap_err();
-            assert!(error.to_string().contains("must belong to the worker user"));
+            assert!(format!("{error:#}").contains("must belong"));
             assert_eq!(fs::metadata("/").unwrap().mode(), root.mode());
             let foreign_link = temporary.path().join("foreign-link");
             symlink("/", &foreign_link).unwrap();
@@ -2337,6 +2523,7 @@ mod tests {
             pid: None,
             container: None,
             runtime: None,
+            windows_job: None,
         };
         atomic_json(&dir.join("journal.json"), &journal).unwrap();
         Arc::new(Attempt {
@@ -2405,7 +2592,17 @@ mod tests {
             attempt_id: "attempt".into(),
             state: "assigned".into(),
             spec: JobSpec {
-                command: vec!["sh".into(), "-c".into(), "printf edited > input".into()],
+                command: if cfg!(windows) {
+                    vec![
+                        "powershell.exe".into(),
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-Command".into(),
+                        "[IO.File]::WriteAllText('input', 'edited')".into(),
+                    ]
+                } else {
+                    vec!["sh".into(), "-c".into(), "printf edited > input".into()]
+                },
                 inputs: vec![FileEntry {
                     path: "input".into(),
                     hash: hash.clone(),
@@ -2433,6 +2630,114 @@ mod tests {
             b"original"
         );
     }
+    #[cfg(windows)]
+    fn windows_descendant_command(directory: &Path, wait: bool) -> Command {
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; Write-Output before; [Console]::Error.WriteLine('error'); $child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') -NoNewWindow -PassThru; Set-Content ready $child.Id; {}",
+            if wait {
+                "Wait-Process -Id $child.Id"
+            } else {
+                "exit 0"
+            }
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .current_dir(directory);
+        command
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cancellation_timeout_and_parent_exit_terminate_the_whole_job() {
+        for mode in ["cancel", "timeout", "exit"] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = state_at(temp.path());
+            let attempt = attempt_at(temp.path(), "attempt");
+            let command = windows_descendant_command(temp.path(), mode != "exit");
+            let (cancel, receiver) = watch::channel(false);
+            let cancellation = async {
+                if mode == "cancel" {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    while !temp.path().join("ready").exists() {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "descendant did not start"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    cancel.send(true).unwrap();
+                }
+            };
+            let (result, _) = tokio::join!(
+                execute(
+                    &state,
+                    &attempt,
+                    command,
+                    receiver,
+                    if mode == "timeout" { 3 } else { 15 },
+                    None
+                ),
+                cancellation
+            );
+            if mode == "exit" {
+                assert_eq!(result.unwrap(), 0);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(if mode == "cancel" {
+                        "job cancelled"
+                    } else {
+                        "exceeded timeout"
+                    }),
+                    "{error:#}"
+                );
+            }
+            assert!(temp.path().join("ready").exists());
+            let name = attempt.journal.lock().unwrap().windows_job.clone().unwrap();
+            assert!(windows::absent(&name).unwrap());
+            let logs = fs::read_to_string(attempt.dir.join("logs.jsonl")).unwrap();
+            assert!(logs.contains("before") && logs.contains("error"));
+        }
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_restart_cancellation_queries_named_job_and_never_saved_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .kill_on_drop(true);
+        let (mut child, job, thread) = windows::spawn(&mut command).await.unwrap();
+        attempt
+            .update(|journal| {
+                journal.report.state = "running".into();
+                journal.pid = Some(u32::MAX); // Reused/arbitrary PIDs are never cancellation evidence.
+                journal.windows_job = Some(job.name.clone());
+            })
+            .unwrap();
+        thread.resume().unwrap();
+        load_state(&state).await.unwrap();
+        request_cancel(&state, "job", "attempt").await.unwrap();
+        assert_eq!(
+            state.attempts.lock().unwrap()["attempt"].report().state,
+            "unknown"
+        );
+        assert!(job.active().unwrap() > 0);
+        stop_process(&mut child, &job, None).await.unwrap();
+        drop(job);
+        request_cancel(&state, "job", "attempt").await.unwrap();
+        assert_eq!(
+            state.attempts.lock().unwrap()["attempt"].report().state,
+            "cancelled"
+        );
+    }
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn cleanup_waits_for_zombie_group_without_claiming_absence() {
@@ -2456,6 +2761,7 @@ mod tests {
         cleanup.unwrap();
         assert!(process_group_absent(pgid).unwrap());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_stops_descendants_and_preserves_logs() {
         let temp = tempfile::tempdir().unwrap();
@@ -2484,6 +2790,7 @@ mod tests {
         assert!(logs.contains("before"));
         assert!(logs.contains("error"));
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_term_ignoring_child_after_leader_exits() {
         let temp = tempfile::tempdir().unwrap();
@@ -2514,6 +2821,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!temp.path().join("leaked").exists());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn natural_parent_exit_cleans_stubborn_child_and_retained_pipes() {
         let temp = tempfile::tempdir().unwrap();
@@ -2533,6 +2841,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!temp.path().join("leaked").exists());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_stubborn_child_before_returning_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -2552,6 +2861,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!temp.path().join("leaked").exists());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn restarted_dead_attempt_can_be_cancelled_without_signalling_saved_pid() {
         let temp = tempfile::tempdir().unwrap();
@@ -2587,6 +2897,7 @@ mod tests {
             serde_json::from_reader(File::open(attempt.dir.join("journal.json")).unwrap()).unwrap();
         assert_eq!(persisted.report.state, "cancelled");
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn restarted_live_group_cancel_remains_unknown_and_never_signals_it() {
         let temp = tempfile::tempdir().unwrap();
@@ -2613,6 +2924,7 @@ mod tests {
         assert!(!process_group_absent(pgid).unwrap());
         stop_process(&mut child, pgid, None).await.unwrap();
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn ready_environment_tool_drift_is_rejected_before_job_runs() {
         use std::os::unix::fs::PermissionsExt;
@@ -2671,6 +2983,7 @@ mod tests {
         assert_eq!(state.environments.lock().unwrap()["a/1"].state, "failed");
         assert!(fs::read_to_string(tool).unwrap().contains("2.0.0"));
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn preparation_retry_initialization_failure_is_durable_and_releases_drain() {
         let temp = tempfile::tempdir().unwrap();
@@ -2781,6 +3094,7 @@ mod tests {
         assert_eq!(environments[0].state, "failed");
         assert!(!temp.path().join("should-not-run").exists());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn image_path_is_inspected_by_immutable_id_and_cached_without_shell() {
         use std::os::unix::fs::PermissionsExt;
@@ -2824,9 +3138,25 @@ mod tests {
         assert_eq!(version_token("v22.19.0"), "22.19.0");
         assert_eq!(version_token("Python 3.13.7"), "3.13.7");
         assert_eq!(
+            version_token("openjdk version \"17.0.15\" 2025-04-15"),
+            "17.0.15"
+        );
+        assert_eq!(
             version_token("Apple clang version 17.0.0 (clang)"),
             "17.0.0"
         );
+    }
+    #[test]
+    fn windows_input_spellings_do_not_merge_distinct_files_or_directories() {
+        let entry = |path: &str| FileEntry {
+            path: path.into(),
+            hash: "a".repeat(64),
+            size: 0,
+            mode: 0o644,
+        };
+        assert!(validate_windows_inputs(&[entry("A/a"), entry("a/b")]).is_err());
+        assert!(validate_windows_inputs(&[entry("A"), entry("a")]).is_err());
+        validate_windows_inputs(&[entry("a/one"), entry("a/two")]).unwrap();
     }
     #[test]
     fn environment_expands_only_known_variables() {
@@ -2838,7 +3168,11 @@ mod tests {
             .env
             .insert("OTHER".into(), "$(echo bad):${UNKNOWN}".into());
         let values = expanded_env(Some(&environment), None, Path::new("/tmp/tools"), None);
-        assert!(values["PATH"].starts_with("/tmp/tools/custom:/tmp/tools/bin:"));
+        assert!(values["PATH"].starts_with(if cfg!(windows) {
+            "/tmp/tools/custom:/tmp/tools/bin;"
+        } else {
+            "/tmp/tools/custom:/tmp/tools/bin:"
+        }));
         assert_eq!(values["OTHER"], "$(echo bad):${UNKNOWN}");
     }
     #[test]

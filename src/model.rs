@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    path::{Component, Path},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,25 +20,47 @@ pub fn normalize_arch(s: &str) -> String {
     .into()
 }
 pub fn safe_relative(s: &str) -> Result<()> {
-    let normalized = Path::new(s)
-        .components()
-        .filter_map(|c| {
-            if let Component::Normal(p) = c {
-                p.to_str()
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    if s.is_empty()
-        || s.contains(['\\', '\0'])
-        || normalized != s
-        || !Path::new(s)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+    if s.split('/')
+        .any(|part| part.is_empty() || matches!(part, "." | "..") || part.contains(['\\', '\0']))
     {
         bail!("unsafe relative path: {s}")
+    }
+    Ok(())
+}
+pub fn windows_relative(s: &str) -> Result<()> {
+    safe_relative(s)?;
+    if s.split('/').any(|part| {
+        let stem = part
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        part.ends_with(['.', ' '])
+            || part.chars().any(|c| c < ' ' || "\\<>:\"|?*".contains(c))
+            || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
+            || stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|suffix| {
+                    matches!(
+                        suffix,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+    }) {
+        bail!("unsafe Windows relative path: {s}")
+    }
+    Ok(())
+}
+pub fn validate_env_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.contains(['=', '\0'])
+        || key
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("YLCC_"))
+    {
+        bail!("invalid or reserved environment variable")
     }
     Ok(())
 }
@@ -157,6 +178,9 @@ impl JobSpec {
         let mut paths = std::collections::BTreeSet::new();
         for f in &self.inputs {
             safe_relative(&f.path)?;
+            if self.requirements.os.as_deref() == Some("windows") {
+                windows_relative(&f.path)?;
+            }
             validate_hash(&f.hash)?;
             if !paths.insert(&f.path) {
                 bail!("duplicate input path")
@@ -164,11 +188,12 @@ impl JobSpec {
         }
         for p in &self.outputs {
             safe_relative(p)?;
+            if self.requirements.os.as_deref() == Some("windows") {
+                windows_relative(p)?;
+            }
         }
         for key in self.env.keys() {
-            if key.contains('=') || key.contains('\0') || key.starts_with("YLCC_") {
-                bail!("invalid or reserved environment variable")
-            }
+            validate_env_key(key)?;
         }
         if self.requirements.emulation {
             bail!("emulation is not implemented; use a native matching worker")
@@ -310,10 +335,89 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_paths() {
-        for s in ["../x", "/tmp/x", "a/../b", "a\\b", ""] {
+        for s in [
+            "../x",
+            "/tmp/x",
+            "a/../b",
+            "a\\b",
+            "",
+            "//host/share",
+            "a//b",
+            "a/./b",
+            "a\0b",
+        ] {
             assert!(safe_relative(s).is_err());
+            assert!(windows_relative(s).is_err());
         }
         assert!(safe_relative("dir/a.txt").is_ok());
+    }
+    #[test]
+    fn windows_component_rules_do_not_restrict_unix_jobs() {
+        for s in [
+            "C:/temp/a",
+            "a:stream",
+            "a.",
+            "a ",
+            "NUL",
+            "con.txt",
+            "COM1.log",
+            "lpt9",
+            "COM¹.txt",
+            "CONIN$",
+            "con .txt",
+            "a/aux/file",
+            "a\nfile",
+            "a?b",
+            "a|b",
+            "aux.txt",
+            "con/part.rs",
+            "logs/2026-10-16T11:22:33.log",
+        ] {
+            assert!(safe_relative(s).is_ok(), "{s}");
+            assert!(windows_relative(s).is_err(), "{s}");
+            let mut spec = JobSpec {
+                command: vec!["test".into()],
+                inputs: vec![FileEntry {
+                    path: s.into(),
+                    hash: "a".repeat(64),
+                    size: 0,
+                    mode: 0o644,
+                }],
+                outputs: vec![s.into()],
+                ..Default::default()
+            };
+            for os in [None, Some("linux"), Some("macos")] {
+                spec.requirements.os = os.map(str::to_owned);
+                assert!(spec.validate().is_ok(), "{s}");
+            }
+            spec.requirements.os = Some("windows".into());
+            assert!(spec.validate().is_err(), "{s}");
+        }
+        assert!(windows_relative("dir/COM10.txt").is_ok());
+        assert!(windows_relative("dir/hello world.txt").is_ok());
+    }
+    #[test]
+    fn reserved_environment_keys_are_case_insensitive_and_nonempty() {
+        let mut spec = JobSpec {
+            command: vec!["test".into()],
+            ..Default::default()
+        };
+        for key in [
+            "",
+            "YLCC_JOB_ID",
+            "ylcc_job_id",
+            "YlCc_attempt_id",
+            "YLCC_",
+            "bad=name",
+            "bad\0name",
+        ] {
+            spec.env = BTreeMap::from([(key.into(), "value".into())]);
+            assert!(spec.validate().is_err(), "{key:?}");
+        }
+        for key in ["PATH", "YLCC", "MY_YLCC_VALUE", "ordinary"] {
+            spec.env = BTreeMap::from([(key.into(), "value".into())]);
+            assert!(spec.validate().is_ok(), "{key}");
+        }
     }
     #[test]
     fn architecture_and_gpu_are_required() {

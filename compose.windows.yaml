@@ -1,0 +1,28 @@
+services:
+  worker:
+    # Build the Windows runtime image locally until this versioned tag is published.
+    image: ${YLCC_WINDOWS_IMAGE:?Set a tested Windows image reference}
+    platform: windows/amd64
+    isolation: ${YLCC_WINDOWS_ISOLATION:-hyperv}
+    user: ContainerUser
+    command:
+      - --hub
+      - ${YLCC_HUB_URL:?Set the private HTTPS Hub URL}
+      - --token-file
+      - C:\ylcc-data\config\token
+      - worker
+      - --id
+      - ${YLCC_WORKER_ID:-windows-container}
+      - --data-dir
+      - C:\ylcc-data\worker
+      - --max-jobs
+      - ${YLCC_MAX_JOBS:-1}
+    volumes:
+      - type: volume
+        source: worker-data
+        target: C:\ylcc-data
+    restart: unless-stopped
+volumes:
+  worker-data:
+    external: true
+    name: ${YLCC_WINDOWS_DATA_VOLUME:?Set the dedicated initialized worker volume name}
