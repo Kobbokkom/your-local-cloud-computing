@@ -38,8 +38,11 @@ This is a pool for trusted people and trusted code. Native jobs have the worker 
 Download a versioned binary for Linux/macOS on x86_64/arm64. The installer verifies the archive against the release's `SHA256SUMS` before installing it:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.1.3/scripts/install.sh -o /tmp/ylcc-install.sh
-bash /tmp/ylcc-install.sh --version v0.1.3
+task_tmp="$(mktemp -d)"
+curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.2.0/scripts/install.sh -o "$task_tmp/install.sh"
+bash "$task_tmp/install.sh" --version v0.2.0
+rm "$task_tmp/install.sh"
+rmdir "$task_tmp"
 export PATH="$HOME/.local/bin:$PATH"
 ylcc --version
 ```
@@ -51,9 +54,9 @@ Use `--prefix /your/prefix` to change the install location. You can also downloa
 The binary installer installs the executable and license notices. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
 
 ```bash
-export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.3"
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.2.0"
 mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
-git clone --depth 1 --branch v0.1.3 \
+git clone --depth 1 --branch v0.2.0 \
   https://github.com/semanticist21/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
 ```
 
@@ -160,6 +163,51 @@ Select files/folders with repeated `--input`, use `--project` for the whole proj
 
 Inputs are immutable after submission; changing local files affects the next submission. Each attempt gets a fresh writable checkout. Only declared relative output paths are collected. No implicit heavy local fallback, automatic retry on another worker, or cross-architecture emulation occurs. A disconnected/`unknown` attempt needs inspection before resubmission because its original process may still exist.
 
+## Project tasks
+
+Keep repeatable commands in `ylcc.yaml` in your application repository. The requester uses its existing user-level Hub/token configuration; do not put credentials in this file. Commands and selected paths are relative to the YAML file's directory, even when invoked elsewhere.
+
+```yaml
+version: 1
+tasks:
+  test:
+    command: [cargo, test, --locked]
+    inputs: [Cargo.toml, Cargo.lock, src, tests]
+    requirements:
+      os: linux
+      arch: x86_64
+      tools:
+        cargo: "*"
+    timeout_secs: 1800
+    priority: 0
+```
+
+Use your project's actual inputs and command. Add `outputs` for files to download, `environment` for a registered tool environment, or use `project: true` instead of `inputs` to select the whole project. A command without source inputs must explicitly set `no_input: true`. Project files define executable commands; inspect a new file before running it.
+
+```bash
+ylcc task list
+ylcc task run test
+ylcc task run test --file /path/to/application/ylcc.yaml --detach
+```
+
+YAML version 1 rejects unknown fields and invalid selections. CPU/memory percentage limits are not supported by this schema; configure actual resource caps in the container runtime or operating system. `max_jobs` limits simultaneous jobs, not their CPU or memory consumption.
+
+### Control queued work
+
+The Hub persists the queue and worker controls. Higher numeric priority runs first among compatible queued jobs; equal priorities retain submission order. Priority defaults to `0` and accepts `-100` through `100`. Changing priority never interrupts an assigned or running job.
+
+```bash
+ylcc run --no-input --os linux --priority 10 --detach -- true
+ylcc jobs priority JOB_ID 20
+ylcc workers pause WORKER_ID
+ylcc workers resume WORKER_ID
+ylcc workers limit WORKER_ID --max-jobs 1
+```
+
+Pausing stops new assignments and new environment preparation while existing work finishes. Resume allows scheduling again. A live concurrency limit may be raised only up to the worker's startup `--max-jobs` capacity; lowering it lets active work finish. Set the startup capacity when installing the worker service. Controls survive Hub restarts and worker reconnects. To update safely, pause a worker, wait until its active attempts finish, update it, then resume it. Cancellation remains an explicit per-job operation.
+
+Priority submission requires a Hub advertising priority support; older Hubs are rejected instead of silently ignoring a nonzero priority.
+
 ## Background services
 
 Install under the account that should run workloads. On shared managed machines, use a dedicated account without administrative rights; keep management credentials out of that account. Its `HOME`, token, executable/support checkout, tool caches and worker data must reside on filesystems that enforce ownership and permissions. Use mode `600` for tokens and `700` for private directories, and keep executable paths unwritable by unrelated accounts.
@@ -227,7 +275,7 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-worker --resta
   --user "$YLCC_UID:$YLCC_GID" \
   --mount "type=bind,src=$YLCC_DATA_DIR/worker,dst=/data" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ghcr.io/semanticist21/your-local-cloud-computing:0.1.3 \
+  ghcr.io/semanticist21/your-local-cloud-computing:0.2.0 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
@@ -242,7 +290,7 @@ Native workers can use an already configured Docker or Podman runtime; verify it
 mkdir -p "$YLCC_SUPPORT_DIR/dist"
 # Extract the verified Linux release archive for the runtime CPU; arm64 example:
 tar -xzf /path/to/ylcc-linux-aarch64.tar.gz -C "$YLCC_SUPPORT_DIR/dist"
-docker --context "$YLCC_DOCKER_CONTEXT" build --target runtime-client -t ylcc-runtime-client:0.1.3 \
+docker --context "$YLCC_DOCKER_CONTEXT" build --target runtime-client -t ylcc-runtime-client:0.2.0 \
   -f "$YLCC_SUPPORT_DIR/Dockerfile" "$YLCC_SUPPORT_DIR"
 ```
 
@@ -259,7 +307,7 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-runtime-worker
   --mount "type=bind,src=$YLCC_RUNTIME_SOCKET,dst=/var/run/docker.sock" \
   --mount "type=bind,src=$YLCC_RUNTIME_DATA,dst=$YLCC_RUNTIME_DATA" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ylcc-runtime-client:0.1.3 \
+  ylcc-runtime-client:0.2.0 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id runtime-worker --data-dir "$YLCC_RUNTIME_DATA" --max-jobs 1
 ```
@@ -320,7 +368,7 @@ From the [support checkout](#download-examples-and-agent-support-files), the [CU
 )
 ```
 
-macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.1.3.
+macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.2.0.
 
 ## Diagnose and develop
 
@@ -337,4 +385,4 @@ macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requestin
 
 CI builds/tests on native Linux x86_64, Linux arm64, Intel macOS and Apple Silicon macOS. Release automation creates four archives, checksums, a multi-platform image and a draft GitHub Release for final real-machine validation. Published release availability and successful local hardware tests are separate checks.
 
-YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.1.3 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.
+YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.2.0 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.

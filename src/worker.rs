@@ -94,7 +94,8 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create private directory {}", path.display()))?;
+    fs::create_dir_all(path)
+        .with_context(|| format!("create private directory {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -175,22 +176,37 @@ impl State {
         status: &str,
         error: Option<String>,
     ) -> Result<()> {
-        let value = EnvironmentStatus {
+        let mut value = EnvironmentStatus {
             worker_id: self.id.clone(),
             environment_id: environment.id.clone(),
             revision: environment.revision.clone(),
             state: status.into(),
             error,
         };
-        let dir = self.environment_dir(environment)?;
-        private_dir(&dir)?;
-        atomic_json(&dir.join("status.json"), &value)?;
+        let persisted = (|| {
+            let dir = self.environment_dir(environment)?;
+            private_dir(&dir)?;
+            atomic_json(&dir.join("status.json"), &value)
+        })();
+        if let Err(error) = &persisted {
+            if status != "failed" {
+                return persisted;
+            }
+            // A disk failure must not leave the Hub draining this worker forever.
+            value.error = Some(format!(
+                "{}; could not persist environment failure: {error:#}",
+                value
+                    .error
+                    .as_deref()
+                    .unwrap_or("environment preparation failed")
+            ));
+        }
         self.environments.lock().unwrap().insert(
             env_key(&environment.id, &environment.revision),
             value.clone(),
         );
         self.emit(WorkerMessage::Environment { status: value });
-        Ok(())
+        persisted
     }
     fn hello(&self) -> WorkerMessage {
         WorkerMessage::Hello {
@@ -1811,7 +1827,6 @@ print('ready')"#
     Ok(())
 }
 async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) -> Result<()> {
-    let dir = state.environment_dir(environment)?;
     let _drain = state.drain.write().await;
     if !explicit
         && let Some(status) = state
@@ -1828,21 +1843,22 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
             "environment preparation failed; inspect environment logs and explicitly prepare again"
         );
     }
-    private_dir(&dir)?;
-    private_dir(&dir.join("bin"))?;
-    let definition = dir.join("definition.json");
-    if definition.exists() {
-        let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
-        ensure!(
-            serde_json::to_value(existing)? == serde_json::to_value(environment)?,
-            "environment revision is immutable; choose a new revision"
-        );
-    } else {
-        atomic_json(&definition, environment)?;
-    }
-    let logger = environment_logger(state, environment)?;
-    state.environment_status(environment, "preparing", None)?;
     let result = async {
+        let dir = state.environment_dir(environment)?;
+        private_dir(&dir)?;
+        private_dir(&dir.join("bin"))?;
+        let definition = dir.join("definition.json");
+        if definition.exists() {
+            let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
+            ensure!(
+                serde_json::to_value(existing)? == serde_json::to_value(environment)?,
+                "environment revision is immutable; choose a new revision"
+            );
+        } else {
+            atomic_json(&definition, environment)?;
+        }
+        let logger = environment_logger(state, environment)?;
+        state.environment_status(environment, "preparing", None)?;
         let mut requirements = environment.requirements.clone(); requirements.tools.clear(); requirements.build_target = None;
         if environment.image.is_some() { requirements.os = None; requirements.abi = None; }
         ensure!(state.capabilities.mismatch(&requirements).is_empty(), "worker does not satisfy environment platform requirements");
@@ -1866,13 +1882,16 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
         }
         verify_environment(state, environment, image_id.as_deref(), &logger, None).await?;
         if let Some(image) = image_id { atomic_json(&dir.join("image.json"), &image)?; }
+        state.environment_status(environment, "ready", None)?;
         Ok::<_, anyhow::Error>(())
     }.await;
-    match &result {
-        Ok(()) => state.environment_status(environment, "ready", None)?,
-        Err(error) => {
-            state.environment_status(environment, "failed", Some(format!("{error:#}")))?
-        }
+    if let Err(error) = &result
+        && let Err(persistence) =
+            state.environment_status(environment, "failed", Some(format!("{error:#}")))
+    {
+        return Err(result.unwrap_err()).context(format!(
+            "could not persist environment failure: {persistence:#}"
+        ));
     }
     result
 }
@@ -2651,6 +2670,116 @@ mod tests {
         assert!(!attempt.dir.join("work").exists());
         assert_eq!(state.environments.lock().unwrap()["a/1"].state, "failed");
         assert!(fs::read_to_string(tool).unwrap().contains("2.0.0"));
+    }
+    #[tokio::test]
+    async fn preparation_retry_initialization_failure_is_durable_and_releases_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let environment = Environment {
+            id: "broken".into(),
+            revision: "1".into(),
+            setup: vec![
+                "rmdir \"$YLCC_ENV_DIR/bin\"; printf bad > \"$YLCC_ENV_DIR/bin\"; exit 1".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(prepare(&state, &environment, true).await.is_err());
+        let mut events = state.events.subscribe();
+        let error = prepare(&state, &environment, true).await.unwrap_err();
+        assert!(format!("{error:#}").contains("create private directory"));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            WorkerMessage::Environment { status } if status.state == "failed"
+        ));
+        let status: EnvironmentStatus = serde_json::from_reader(
+            File::open(
+                state
+                    .environment_dir(&environment)
+                    .unwrap()
+                    .join("status.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status.state, "failed");
+        assert_eq!(
+            state.environments.lock().unwrap()["broken/1"].state,
+            "failed"
+        );
+        let attempt = attempt_at(temp.path(), "unrelated");
+        let job = Job {
+            id: "unrelated".into(),
+            attempt_id: "unrelated".into(),
+            state: "assigned".into(),
+            spec: JobSpec {
+                command: vec!["sh".into(), "-c".into(), "printf ok > completed".into()],
+                ..Default::default()
+            },
+            worker_id: None,
+            created_at: 0,
+            updated_at: 0,
+            exit_code: None,
+            error: None,
+            results: vec![],
+        };
+        let (_keepalive, receiver) = watch::channel(false);
+        let (exit, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_attempt(&state, &attempt, &job, None, receiver),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(exit, 0);
+        assert_eq!(
+            fs::read_to_string(attempt.dir.join("work/completed")).unwrap(),
+            "ok"
+        );
+    }
+    #[tokio::test]
+    async fn preparation_definition_error_reports_failure_without_running_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let environment = Environment {
+            id: "broken".into(),
+            revision: "1".into(),
+            setup: vec!["touch should-not-run".into()],
+            ..Default::default()
+        };
+        let dir = state.environment_dir(&environment).unwrap();
+        private_dir(&dir).unwrap();
+        fs::write(dir.join("definition.json"), "invalid json").unwrap();
+        assert!(prepare(&state, &environment, true).await.is_err());
+        let status: EnvironmentStatus =
+            serde_json::from_reader(File::open(dir.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status.state, "failed");
+        assert!(!dir.join("should-not-run").exists());
+    }
+    #[tokio::test]
+    async fn preparation_storage_error_reports_failure_in_events_and_reconnect_hello() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let environment = Environment {
+            id: "broken".into(),
+            revision: "1".into(),
+            setup: vec!["touch should-not-run".into()],
+            ..Default::default()
+        };
+        fs::write(temp.path().join("environments/broken"), "not a directory").unwrap();
+        let mut events = state.events.subscribe();
+        assert!(prepare(&state, &environment, true).await.is_err());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            WorkerMessage::Environment { status }
+                if status.state == "failed"
+                    && status.error.as_deref().is_some_and(|error| error.contains("could not persist environment failure"))
+        ));
+        let WorkerMessage::Hello { environments, .. } = state.hello() else {
+            panic!("expected worker hello");
+        };
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].state, "failed");
+        assert!(!temp.path().join("should-not-run").exists());
     }
     #[tokio::test]
     async fn image_path_is_inspected_by_immutable_id_and_cached_without_shell() {

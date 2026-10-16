@@ -135,6 +135,8 @@ pub struct FileEntry {
 pub struct JobSpec {
     pub command: Vec<String>,
     #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
     pub inputs: Vec<FileEntry>,
     #[serde(default)]
     pub outputs: Vec<String>,
@@ -148,6 +150,7 @@ pub struct JobSpec {
 }
 impl JobSpec {
     pub fn validate(&self) -> Result<()> {
+        validate_priority(self.priority)?;
         if self.command.is_empty() || self.command[0].is_empty() {
             bail!("command is required")
         }
@@ -192,8 +195,27 @@ pub struct WorkerInfo {
     pub id: String,
     pub capabilities: Capabilities,
     pub max_jobs: usize,
+    #[serde(default)]
+    pub paused: bool,
     pub online: bool,
     pub last_seen: u64,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControl {
+    pub paused: Option<bool>,
+    pub max_jobs: Option<usize>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityRequest {
+    pub priority: i32,
+}
+pub fn validate_priority(priority: i32) -> Result<()> {
+    if !(-100..=100).contains(&priority) {
+        bail!("priority must be between -100 and 100")
+    }
+    Ok(())
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -314,5 +336,33 @@ mod tests {
             })
             .is_empty()
         );
+    }
+    #[test]
+    fn priorities_are_bounded_and_old_records_default_to_normal() {
+        let mut spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "command":["true"],
+            "environment":null,
+            "container":null,
+            "timeout_secs":null
+        }))
+        .unwrap();
+        assert_eq!(spec.priority, 0);
+        for priority in [-100, 0, 100] {
+            spec.priority = priority;
+            assert!(spec.validate().is_ok());
+        }
+        for priority in [-101, 101] {
+            spec.priority = priority;
+            assert!(spec.validate().is_err());
+        }
+        let worker: WorkerInfo = serde_json::from_value(serde_json::json!({
+            "id":"old-worker",
+            "capabilities":Capabilities::default(),
+            "max_jobs":1,
+            "online":false,
+            "last_seen":0
+        }))
+        .unwrap();
+        assert!(!worker.paused);
     }
 }

@@ -14,7 +14,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -70,6 +70,12 @@ struct Store {
     token: String,
     sessions: HashMap<String, Session>,
 }
+#[derive(Default, Serialize, Deserialize)]
+struct WorkerSettings {
+    paused: bool,
+    max_jobs: Option<usize>,
+    capacity: usize,
+}
 
 fn identifier(value: &str) -> Result<()> {
     if value.is_empty()
@@ -107,11 +113,13 @@ fn encode<T: Serialize>(value: &T) -> Result<String> {
 
 impl Store {
     fn open(data: PathBuf, token: String) -> Result<Self> {
-        std::fs::create_dir_all(data.join("blobs"))?;
+        crate::worker::private_dir(&data)?;
+        crate::worker::private_dir(&data.join("blobs"))?;
         let db = Connection::open(data.join("hub.sqlite"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL, environment TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS worker_settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environment_revisions (id TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(id, revision));
             CREATE TABLE IF NOT EXISTS environment_status (worker TEXT NOT NULL, environment TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(worker, environment, revision));
@@ -124,6 +132,12 @@ impl Store {
         };
         for mut worker in store.workers()? {
             worker.online = false;
+            let settings = store.worker_settings(&worker)?;
+            worker.paused = settings.paused;
+            worker.max_jobs = settings
+                .max_jobs
+                .unwrap_or(settings.capacity)
+                .min(settings.capacity);
             store.save_worker(&worker)?;
         }
         for mut job in store.jobs()? {
@@ -193,6 +207,67 @@ impl Store {
     fn save_worker(&mut self, worker: &WorkerInfo) -> Result<()> {
         self.db.execute("INSERT INTO workers(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![worker.id, encode(worker)?])?;
         Ok(())
+    }
+    fn worker_settings(&self, worker: &WorkerInfo) -> Result<WorkerSettings> {
+        Ok(self
+            .one("SELECT data FROM worker_settings WHERE id=?1", &worker.id)?
+            .unwrap_or(WorkerSettings {
+                paused: worker.paused,
+                capacity: worker.max_jobs,
+                ..Default::default()
+            }))
+    }
+    fn save_worker_settings(&mut self, id: &str, settings: &WorkerSettings) -> Result<()> {
+        self.db.execute("INSERT INTO worker_settings(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![id, encode(settings)?])?;
+        Ok(())
+    }
+    fn control_worker(&mut self, id: &str, control: WorkerControl) -> ApiResult<WorkerInfo> {
+        let mut worker = self
+            .one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", id)?
+            .ok_or_else(|| missing("worker"))?;
+        if control.paused.is_none() && control.max_jobs.is_none() {
+            return Err(invalid("specify paused or max_jobs"));
+        }
+        let mut settings = self.worker_settings(&worker)?;
+        if let Some(limit) = control.max_jobs {
+            if !(1..=256).contains(&limit) {
+                return Err(invalid("max_jobs must be between 1 and 256"));
+            }
+            if limit > settings.capacity {
+                return Err(invalid(format!(
+                    "max_jobs cannot exceed worker's advertised capacity of {}; restart the worker with a higher --max-jobs first",
+                    settings.capacity
+                )));
+            }
+            settings.max_jobs = Some(limit);
+        }
+        if let Some(paused) = control.paused {
+            settings.paused = paused;
+        }
+        worker.paused = settings.paused;
+        worker.max_jobs = settings
+            .max_jobs
+            .unwrap_or(settings.capacity)
+            .min(settings.capacity);
+        self.save_worker_settings(id, &settings)?;
+        self.save_worker(&worker)?;
+        self.schedule()?;
+        Ok(worker)
+    }
+    fn set_priority(&mut self, id: &str, priority: i32) -> ApiResult<Job> {
+        validate_priority(priority).map_err(invalid)?;
+        let mut job = self.job(id)?.ok_or_else(|| missing("job"))?;
+        if job.state != "queued" {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "priority can only be changed for a queued job".into(),
+            ));
+        }
+        job.spec.priority = priority;
+        job.updated_at = now();
+        self.save_job(&job)?;
+        self.schedule()?;
+        Ok(self.job(id)?.expect("saved job"))
     }
     fn save_status(&mut self, status: &EnvironmentStatus) -> Result<()> {
         self.db.execute("INSERT INTO environment_status(worker,environment,revision,data) VALUES(?1,?2,?3,?4) ON CONFLICT(worker,environment,revision) DO UPDATE SET data=excluded.data", params![status.worker_id, status.environment_id, status.revision, encode(status)?])?;
@@ -299,6 +374,8 @@ impl Store {
     fn schedule(&mut self) -> Result<()> {
         let workers = self.workers()?;
         let mut jobs = self.jobs()?;
+        // Stable ordering retains the database creation order for equal priorities.
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.spec.priority));
         for job in &mut jobs {
             if job.state == "queued" && self.cancel_requested(&job.id)? {
                 job.state = "cancelled".into();
@@ -306,7 +383,10 @@ impl Store {
                 self.save_job(job)?;
             }
         }
-        for worker in workers.iter().filter(|worker| worker.online) {
+        for worker in workers
+            .iter()
+            .filter(|worker| worker.online && !worker.paused)
+        {
             let Some(tx) = self.sessions.get(&worker.id).map(|s| s.tx.clone()) else {
                 continue;
             };
@@ -566,12 +646,20 @@ impl Store {
             bail!("unsupported worker architecture")
         }
         let session = Uuid::new_v4();
+        let previous = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?;
+        let mut settings = match previous {
+            Some(worker) => self.worker_settings(&worker)?,
+            None => WorkerSettings::default(),
+        };
+        settings.capacity = max_jobs;
+        self.save_worker_settings(&id, &settings)?;
         self.sessions
             .insert(id.clone(), Session { id: session, tx });
         self.save_worker(&WorkerInfo {
             id: id.clone(),
             capabilities,
-            max_jobs,
+            max_jobs: settings.max_jobs.unwrap_or(max_jobs).min(max_jobs),
+            paused: settings.paused,
             online: true,
             last_seen: now(),
         })?;
@@ -828,12 +916,14 @@ pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Resu
 fn router(state: Shared) -> Router {
     let protected = Router::new()
         .route("/v1/workers", get(workers))
+        .route("/v1/workers/{id}/control", post(control_worker))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
         .route("/v1/jobs", post(submit).get(jobs))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/logs", get(logs))
         .route("/v1/jobs/{id}/cancel", post(cancel))
+        .route("/v1/jobs/{id}/priority", post(set_priority))
         .route(
             "/v1/environments",
             get(environments).post(upsert_environment),
@@ -846,7 +936,13 @@ fn router(state: Shared) -> Router {
     Router::new()
         .route(
             "/health",
-            get(|| async { Json(serde_json::json!({"status":"ok"})) }),
+            get(|| async {
+                Json(serde_json::json!({
+                    "status":"ok",
+                    "version":env!("CARGO_PKG_VERSION"),
+                    "capabilities":["job_priority", "worker_control"]
+                }))
+            }),
         )
         .merge(protected)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -890,6 +986,20 @@ async fn authenticate(
 }
 async fn workers(State(state): State<Shared>) -> ApiResult<Json<Vec<WorkerInfo>>> {
     Ok(Json(lock(&state)?.workers()?))
+}
+async fn control_worker(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Json(control): Json<WorkerControl>,
+) -> ApiResult<Json<WorkerInfo>> {
+    Ok(Json(lock(&state)?.control_worker(&id, control)?))
+}
+async fn set_priority(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Json(request): Json<PriorityRequest>,
+) -> ApiResult<Json<Job>> {
+    Ok(Json(lock(&state)?.set_priority(&id, request.priority)?))
 }
 async fn jobs(State(state): State<Shared>) -> ApiResult<Json<Vec<Job>>> {
     Ok(Json(lock(&state)?.jobs()?))
@@ -1269,6 +1379,327 @@ mod tests {
             .unwrap();
         (session, rx)
     }
+    fn finish(store: &mut Store, job: &Job) {
+        store
+            .report(
+                job.worker_id.as_deref().unwrap(),
+                AttemptReport {
+                    job_id: job.id.clone(),
+                    attempt_id: job.attempt_id.clone(),
+                    state: "succeeded".into(),
+                    exit_code: Some(0),
+                    error: None,
+                    results: vec![],
+                },
+            )
+            .unwrap();
+        store.schedule().unwrap();
+    }
+
+    #[test]
+    fn pause_drains_active_jobs_and_resume_assigns_queued_work() {
+        let (_dir, mut store) = test_store();
+        let (_session, mut rx) = worker(&mut store, "one");
+        let first = store.add_job(spec()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+        let paused = store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(paused.paused);
+        let second = store.add_job(spec()).unwrap();
+        assert_eq!(second.state, "queued");
+        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "assigned");
+        assert!(rx.try_recv().is_err());
+        finish(&mut store, &first);
+        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "queued");
+        assert!(rx.try_recv().is_err());
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "assigned");
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+    }
+
+    #[test]
+    fn pause_also_defers_environment_preparation() {
+        let (_dir, mut store) = test_store();
+        let (_session, mut rx) = worker(&mut store, "one");
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let environment = Environment {
+            id: "rust".into(),
+            revision: "v1".into(),
+            setup: vec!["true".into()],
+            ..Default::default()
+        };
+        store
+            .db
+            .execute(
+                "INSERT INTO environments(id,data) VALUES(?1,?2)",
+                params![environment.id, encode(&environment).unwrap()],
+            )
+            .unwrap();
+        store
+            .save_status(&EnvironmentStatus {
+                worker_id: "one".into(),
+                environment_id: environment.id.clone(),
+                revision: environment.revision.clone(),
+                state: "pending".into(),
+                error: None,
+            })
+            .unwrap();
+        let job = store
+            .add_job(JobSpec {
+                environment: Some(environment.id.clone()),
+                ..spec()
+            })
+            .unwrap();
+        assert_eq!(job.state, "queued");
+        assert_eq!(
+            store.status("one", &environment).unwrap().unwrap().state,
+            "pending"
+        );
+        assert!(rx.try_recv().is_err());
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Prepare { .. }));
+    }
+
+    #[test]
+    fn controls_survive_reconnect_restart_and_changing_worker_capacity() {
+        let (dir, mut store) = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        store
+            .connect("one".into(), caps(), 4, vec![], vec![], tx)
+            .unwrap();
+        let info = store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(true),
+                    max_jobs: Some(3),
+                },
+            )
+            .unwrap();
+        assert_eq!(info.max_jobs, 3);
+        drop(store);
+        let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        let restored = store.workers().unwrap().remove(0);
+        assert!(restored.paused);
+        assert!(!restored.online);
+        assert_eq!(restored.max_jobs, 3);
+        for (advertised, expected) in [(4, 3), (2, 2), (4, 3)] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            store
+                .connect("one".into(), caps(), advertised, vec![], vec![], tx)
+                .unwrap();
+            let info = store.workers().unwrap().remove(0);
+            assert!(info.paused);
+            assert_eq!(info.max_jobs, expected);
+        }
+        for invalid_limit in [0, 5, 257] {
+            assert_eq!(
+                store
+                    .control_worker(
+                        "one",
+                        WorkerControl {
+                            max_jobs: Some(invalid_limit),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        assert_eq!(
+            store
+                .control_worker(
+                    "missing",
+                    WorkerControl {
+                        paused: Some(true),
+                        ..Default::default()
+                    }
+                )
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            store
+                .control_worker("one", WorkerControl::default())
+                .unwrap_err()
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn decreasing_concurrency_drains_without_cancelling_running_jobs() {
+        let (_dir, mut store) = test_store();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        store
+            .connect("one".into(), caps(), 2, vec![], vec![], tx)
+            .unwrap();
+        let first = store.add_job(spec()).unwrap();
+        let second = store.add_job(spec()).unwrap();
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    max_jobs: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let third = store.add_job(spec()).unwrap();
+        assert_eq!(third.state, "queued");
+        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "assigned");
+        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "assigned");
+        assert!(rx.try_recv().is_err());
+        finish(&mut store, &first);
+        assert_eq!(store.job(&third.id).unwrap().unwrap().state, "queued");
+        finish(&mut store, &second);
+        assert_eq!(store.job(&third.id).unwrap().unwrap().state, "assigned");
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    max_jobs: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.add_job(spec()).unwrap().state, "assigned");
+    }
+
+    #[test]
+    fn priorities_schedule_highest_first_and_equal_priorities_stay_fifo() {
+        let (_dir, mut store) = test_store();
+        let (_session, mut rx) = worker(&mut store, "one");
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first = store.add_job(spec()).unwrap();
+        let second = store
+            .add_job(JobSpec {
+                priority: 10,
+                ..spec()
+            })
+            .unwrap();
+        let third = store
+            .add_job(JobSpec {
+                priority: 10,
+                ..spec()
+            })
+            .unwrap();
+        let fourth = store.add_job(spec()).unwrap();
+        store.set_priority(&fourth.id, 20).unwrap();
+        assert_eq!(
+            store.set_priority(&first.id, 101).unwrap_err().0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            store.set_priority("missing", 0).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        let original_order: Vec<_> = store.jobs().unwrap().into_iter().map(|j| j.id).collect();
+        assert_eq!(
+            original_order,
+            [
+                first.id.clone(),
+                second.id.clone(),
+                third.id.clone(),
+                fourth.id.clone()
+            ]
+        );
+        store
+            .control_worker(
+                "one",
+                WorkerControl {
+                    paused: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for expected in [&fourth, &second, &third, &first] {
+            let HubMessage::Run { job, .. } = rx.try_recv().unwrap() else {
+                panic!("expected run");
+            };
+            assert_eq!(job.id, expected.id);
+            assert_eq!(
+                store.set_priority(&job.id, 0).unwrap_err().0,
+                StatusCode::CONFLICT
+            );
+            finish(&mut store, &job);
+            assert_eq!(
+                store.set_priority(&job.id, 0).unwrap_err().0,
+                StatusCode::CONFLICT
+            );
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hub_data_is_private_and_directory_aliases_work() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let parent = tempfile::tempdir().unwrap();
+        let data = parent.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = parent.path().join("alias");
+        symlink(&data, &alias).unwrap();
+        let store = Store::open(alias, "test-token-long-enough".into()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&store.blobs)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert!(data.join("hub.sqlite").is_file());
+    }
 
     #[test]
     fn queues_busy_worker_and_rejects_incompatible_platform() {
@@ -1392,6 +1823,7 @@ mod tests {
             id: "one".into(),
             capabilities,
             max_jobs: 1,
+            paused: false,
             online: true,
             last_seen: now(),
         };
