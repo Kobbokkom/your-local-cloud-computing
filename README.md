@@ -38,23 +38,23 @@ This is a pool for trusted people and trusted code. Native jobs have the worker 
 Download a versioned binary for Linux/macOS on x86_64/arm64. The installer verifies the archive against the release's `SHA256SUMS` before installing it:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/Kobbokkom/your-local-cloud-computing/v0.1.0/scripts/install.sh -o /tmp/ylcc-install.sh
-bash /tmp/ylcc-install.sh --version v0.1.0
+curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.1.1/scripts/install.sh -o /tmp/ylcc-install.sh
+bash /tmp/ylcc-install.sh --version v0.1.1
 export PATH="$HOME/.local/bin:$PATH"
 ylcc --version
 ```
 
-Use `--prefix /your/prefix` to change the install location. You can also download and check the [release archives](https://github.com/Kobbokkom/your-local-cloud-computing/releases) yourself. macOS builds are unsigned command-line programs; they are not notarized application bundles. Linux release binaries require glibc 2.35 or newer so native workers can load GPU driver libraries. On musl-based systems such as Alpine, use the container image or build from source for your system; GPU probing additionally requires dynamic library loading. Workload binaries keep their own platform/ABI requirements.
+Use `--prefix /your/prefix` to change the install location. You can also download and check the [release archives](https://github.com/semanticist21/your-local-cloud-computing/releases) yourself. macOS builds are unsigned command-line programs; they are not notarized application bundles. Linux release binaries require glibc 2.35 or newer so native workers can load GPU driver libraries. On musl-based systems such as Alpine, use the container image or build from source for your system; GPU probing additionally requires dynamic library loading. Workload binaries keep their own platform/ABI requirements.
 
 ### Download examples and agent support files
 
 The binary installer installs the executable and license notices. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
 
 ```bash
-export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.0"
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.1"
 mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
-git clone --depth 1 --branch v0.1.0 \
-  https://github.com/Kobbokkom/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
+git clone --depth 1 --branch v0.1.1 \
+  https://github.com/semanticist21/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
 ```
 
 Keep this directory for the examples below. Reuse it if already cloned; it contains public support files, never your pool token. Commands reference this directory explicitly or run examples in a subshell, preserving your application's working directory.
@@ -219,7 +219,7 @@ docker run -d --init --name ylcc-worker --restart unless-stopped \
   --user "$YLCC_UID:$YLCC_GID" \
   --mount "type=bind,src=$YLCC_DATA_DIR/worker,dst=/data" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ghcr.io/kobbokkom/your-local-cloud-computing:0.1.0 \
+  ghcr.io/semanticist21/your-local-cloud-computing:0.1.1 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
@@ -234,7 +234,7 @@ Native workers can use an already configured Docker or Podman runtime. To reques
 mkdir -p "$YLCC_SUPPORT_DIR/dist"
 # Extract the verified Linux release archive for the runtime CPU; arm64 example:
 tar -xzf /path/to/ylcc-linux-aarch64.tar.gz -C "$YLCC_SUPPORT_DIR/dist"
-docker build --target runtime-client -t ylcc-runtime-client:0.1.0 \
+docker build --target runtime-client -t ylcc-runtime-client:0.1.1 \
   -f "$YLCC_SUPPORT_DIR/Dockerfile" "$YLCC_SUPPORT_DIR"
 ```
 
@@ -251,7 +251,7 @@ docker run -d --init --name ylcc-runtime-worker --restart unless-stopped \
   --mount "type=bind,src=$YLCC_RUNTIME_SOCKET,dst=/var/run/docker.sock" \
   --mount "type=bind,src=$YLCC_RUNTIME_DATA,dst=$YLCC_RUNTIME_DATA" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ylcc-runtime-client:0.1.0 \
+  ylcc-runtime-client:0.1.1 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id runtime-worker --data-dir "$YLCC_RUNTIME_DATA" --max-jobs 1
 ```
@@ -312,7 +312,7 @@ From the [support checkout](#download-examples-and-agent-support-files), the [CU
 )
 ```
 
-macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.1.0.
+macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.1.1.
 
 ## Diagnose and develop
 
@@ -329,4 +329,4 @@ macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requestin
 
 CI builds/tests on native Linux x86_64, Linux arm64, Intel macOS and Apple Silicon macOS. Release automation creates four archives, checksums, a multi-platform image and a draft GitHub Release for final real-machine validation. Published release availability and successful local hardware tests are separate checks.
 
-YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.1.0 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.
+YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.1.1 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.

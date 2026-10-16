@@ -1,10 +1,10 @@
 [package]
 name = "ylcc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Run workloads across your own Linux and macOS machines"
-repository = "https://github.com/Kobbokkom/your-local-cloud-computing"
+repository = "https://github.com/semanticist21/your-local-cloud-computing"
 
 [dependencies]
 anyhow = "1"
