@@ -191,6 +191,10 @@ An external Mac volume with “Ignore ownership” enabled (`noowners`) cannot e
 
 On macOS, an administrator can [add a separate APFS volume](https://support.apple.com/guide/disk-utility/add-delete-or-erase-apfs-volumes-dskua9e6a110/mac) to an existing APFS container, optionally with a quota, and enable ownership on that volume. This permits separate storage without changing a neighboring volume's ownership setting. Use OS tools to prepare and mount the chosen volume, verify that ownership is enforced, then place the service account's files there. Start or restart the worker only after its data volume is available.
 
+macOS [file-access privacy controls](https://support.apple.com/en-nz/guide/security/secddd1d86a6/web) also cover removable volumes. A background LaunchDaemon can be denied access even when the service user owns the directory with mode `700`. An installed CLI, readable token or successful interactive/SSH access does not establish privacy approval for the background service. A denied `worker.lock` create/open is one possible symptom; inspect the worker error and macOS privacy logs before changing permissions.
+
+For a standalone native worker denied removable-volume access, a Mac administrator can open **System Settings → Privacy & Security → Full Disk Access**, click **+**, add the installed `ylcc` executable at the fixed path used by the service plist (for example `/usr/local/bin/ylcc`), and enable it. Restart the worker and verify external-data writes and a real job through that LaunchDaemon. Use the macOS approval UI; leave TCC databases and SIP settings untouched. After updating an unsigned or ad-hoc-signed executable, re-check access in the actual service context.
+
 Remove the user service with `ylcc service uninstall --role worker` (or `hub`). This retains tokens and workload data; remove those explicitly only when no longer needed. System-user LaunchDaemon removal uses `service uninstall --role worker --system-user SERVICE_USER` as an administrator.
 
 ## Docker and Podman
