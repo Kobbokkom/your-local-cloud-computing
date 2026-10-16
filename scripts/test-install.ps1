@@ -1,10 +1,11 @@
 # Offline installation checks. Run with Windows PowerShell 5.1 or PowerShell 7 on Windows.
 [CmdletBinding()]
 param(
-    [string]$Installer = (Join-Path $PSScriptRoot 'install.ps1'),
+    [string]$Installer,
     [switch]$SkipExecutionPolicyCheck
 )
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Installer)) { $Installer = Join-Path $PSScriptRoot 'install.ps1' }
 if (-not $SkipExecutionPolicyCheck) {
     # Reproduce a Restricted client without changing any persistent policy scope.
     $policyTemp = Join-Path ([IO.Path]::GetTempPath()) ('ylcc-policy-test-' + [Guid]::NewGuid().ToString('N'))
@@ -45,6 +46,7 @@ Write-Host 'Restricted-parent check passed: only the child process used Bypass; 
     return
 }
 if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') { throw 'Installer checks require process-local Bypass.' }
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $taskTemp = Join-Path ([IO.Path]::GetTempPath()) ('ylcc-install-test-' + [Guid]::NewGuid().ToString('N'))
 $release = Join-Path $taskTemp 'release'

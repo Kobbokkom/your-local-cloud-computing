@@ -55,7 +55,7 @@ try {
     [IO.File]::Copy((Join-Path $taskTemp 'ylcc.exe'), $installTemp)
     $destination = Join-Path $bin 'ylcc.exe'
     if ([IO.File]::Exists($destination)) {
-        try { [IO.File]::Replace($installTemp, $destination, $null) }
+        try { [IO.File]::Replace($installTemp, $destination, [System.Management.Automation.Language.NullString]::Value) }
         catch { throw "Cannot replace ylcc.exe. Drain active jobs, uninstall/stop the worker task, close other YLCC processes, and retry. $($_.Exception.Message)" }
     } else { [IO.File]::Move($installTemp, $destination) }
     $installTemp = $null

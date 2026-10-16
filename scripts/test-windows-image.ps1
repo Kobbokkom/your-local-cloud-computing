@@ -3,9 +3,10 @@
 param(
     [string]$Image = 'ylcc-windows:test',
     [string]$RuntimeImage = 'ylcc-windows:runtime',
-    [string]$Binary = (Join-Path $PSScriptRoot '..\dist\ylcc.exe')
+    [string]$Binary
 )
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Binary)) { $Binary = Join-Path $PSScriptRoot '..\dist\ylcc.exe' }
 function Invoke-Docker([string[]]$Arguments, [switch]$ExpectFailure) {
     $ErrorActionPreference = 'Continue'
     & docker @Arguments
