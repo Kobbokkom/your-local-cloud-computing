@@ -87,21 +87,171 @@ fn systemd_unit(args: &[String], data_dir: &Path, path: &str, role: &str) -> Res
     ))
 }
 
-fn launch_agent(args: &[String], data_dir: &Path, path: &str, role: &str) -> Result<String> {
+fn service_path(path: &Path) -> Result<&str> {
+    let value = path.to_str().context("service paths must be UTF-8")?;
+    checked(value)?;
+    if !path.is_absolute()
+        || value.chars().any(char::is_control)
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("service paths must be absolute without parent traversal")
+    }
+    Ok(value)
+}
+
+fn prepare_service_data(directory: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if uid == unsafe { libc::geteuid() } {
+        return crate::worker::private_dir(directory);
+    }
+    // Configured data-directory symlinks are supported; validate the opened target before chmod.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(directory)
+        .with_context(|| format!("open service data directory {}", directory.display()))?;
+    let metadata = file.metadata()?;
+    if metadata.uid() != uid {
+        bail!(
+            "service data directory must belong to its service user: {}",
+            directory.display()
+        )
+    }
+    if metadata.mode() & 0o7777 != 0o700 {
+        file.set_permissions(fs::Permissions::from_mode(0o700))
+            .with_context(|| {
+                format!(
+                    "set service data directory permissions {}",
+                    directory.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn prepare_log_directory(directory: &Path, directory_uid: u32, directory_mode: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    service_path(directory)?;
+    for parent in directory.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        let metadata = match fs::symlink_metadata(parent) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::DirBuilder::new()
+                    .mode(directory_mode)
+                    .create(parent)
+                    .with_context(|| format!("create log directory {}", parent.display()))?;
+                fs::set_permissions(parent, fs::Permissions::from_mode(directory_mode))?;
+                fs::symlink_metadata(parent)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Sticky root-owned parents protect entries owned by root or the current user.
+        let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != directory_uid)
+            || (metadata.mode() & 0o022 != 0 && !sticky_root)
+        {
+            bail!("unsafe log directory or parent: {}", parent.display())
+        }
+        if parent == directory
+            && (metadata.uid() != directory_uid || metadata.mode() & 0o7777 != directory_mode)
+        {
+            bail!(
+                "log directory must have its expected owner and mode: {}",
+                parent.display()
+            )
+        }
+    }
+    Ok(())
+}
+
+fn prepare_launchd_logs(
+    directory: &Path,
+    role: &str,
+    directory_uid: u32,
+    file_uid: u32,
+    file_gid: u32,
+    directory_mode: u32,
+) -> Result<()> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+    role_name(role)?;
+    prepare_log_directory(directory, directory_uid, directory_mode)?;
+    for name in [
+        format!("service-{role}.log"),
+        format!("service-{role}.err.log"),
+    ] {
+        let path = directory.join(name);
+        let mut options = fs::OpenOptions::new();
+        options
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .mode(0o600);
+        let (file, created) = match options.create_new(true).open(&path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                (options.create_new(false).open(&path)?, false)
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("open service log {}", path.display()));
+            }
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            bail!(
+                "service log must be a regular file with one link: {}",
+                path.display()
+            )
+        }
+        if created {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            if (metadata.uid(), metadata.gid()) != (file_uid, file_gid)
+                && unsafe { libc::fchown(file.as_raw_fd(), file_uid, file_gid) } != 0
+            {
+                return Err(std::io::Error::last_os_error()).context("set service log owner");
+            }
+        }
+        let metadata = file.metadata()?;
+        if (metadata.uid(), metadata.gid()) != (file_uid, file_gid)
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            bail!(
+                "service log has an unexpected owner or permissions: {}",
+                path.display()
+            )
+        }
+    }
+    Ok(())
+}
+
+fn launch_agent(
+    args: &[String],
+    data_dir: &Path,
+    log_dir: &Path,
+    path: &str,
+    role: &str,
+) -> Result<String> {
+    role_name(role)?;
+    let directory = service_path(data_dir)?;
+    service_path(log_dir)?;
     let args = args
         .iter()
         .map(|s| Ok(format!("<string>{}</string>", xml(s)?)))
         .collect::<Result<Vec<_>>>()?
         .join("\n");
-    let log = xml(&data_dir
+    let log = xml(&log_dir
         .join(format!("service-{role}.log"))
         .to_string_lossy())?;
-    let err = xml(&data_dir
+    let err = xml(&log_dir
         .join(format!("service-{role}.err.log"))
         .to_string_lossy())?;
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>org.ylcc.{role}</string>\n<key>ProgramArguments</key><array>\n{args}\n</array>\n<key>WorkingDirectory</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>3</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{err}</string>\n</dict></plist>\n",
-        xml(&data_dir.to_string_lossy())?,
+        xml(directory)?,
         xml(path)?
     ))
 }
@@ -185,12 +335,24 @@ pub fn install(
             );
         }
         "macos" => {
-            let directory = home()?.join("Library/LaunchAgents");
+            prepare_service_data(&data_dir, unsafe { libc::geteuid() })?;
+            let home = home()?;
+            let directory = home.join("Library/LaunchAgents");
             fs::create_dir_all(&directory)?;
             let label = format!("org.ylcc.{role}");
             let domain = format!("gui/{}", unsafe { libc::getuid() });
             let target = format!("{domain}/{label}");
             let file = directory.join(format!("{label}.plist"));
+            let log_dir = home.join("Library/Logs/ylcc");
+            let plist = launch_agent(&args, &data_dir, &log_dir, &path, role)?;
+            prepare_launchd_logs(
+                &log_dir,
+                role,
+                unsafe { libc::getuid() },
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+                0o700,
+            )?;
             if Command::new("launchctl")
                 .args(["print", &target])
                 .output()?
@@ -199,7 +361,7 @@ pub fn install(
             {
                 run("launchctl", &["bootout", &target])?;
             }
-            fs::write(&file, launch_agent(&args, &data_dir, &path, role)?)?;
+            fs::write(&file, plist)?;
             run("launchctl", &["enable", &target])?;
             run(
                 "launchctl",
@@ -265,12 +427,14 @@ fn managed_label(role: &str, user: &str) -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn check_managed_owner(file: &Path, user: &str) -> Result<()> {
-    if !file.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(file)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        bail!("refusing non-regular service definition")
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::symlink_metadata(file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        bail!("refusing unsafe service definition")
     }
     let output = Command::new("/usr/bin/plutil")
         .args(["-extract", "UserName", "raw", "-o", "-"])
@@ -311,12 +475,18 @@ pub fn install_system_user(
                 "installing a system LaunchDaemon requires an administrator (sudo); the workload runs unprivileged"
             )
         }
+        let file = PathBuf::from("/Library/LaunchDaemons").join(format!("{label}.plist"));
+        check_managed_owner(&file, service_user)?;
         let account = Command::new("/usr/bin/id")
             .args(["-u", service_user])
             .output()?;
         if !account.status.success() || String::from_utf8_lossy(&account.stdout).trim() == "0" {
             bail!("system-user must be an existing non-root account")
         }
+        let uid: u32 = String::from_utf8(account.stdout)?
+            .trim()
+            .parse()
+            .context("invalid service UID")?;
         let group = Command::new("/usr/bin/id")
             .args(["-gn", service_user])
             .output()?;
@@ -324,6 +494,16 @@ pub fn install_system_user(
             bail!("cannot resolve service primary group")
         }
         let group = String::from_utf8(group.stdout)?.trim().to_owned();
+        let group_id = Command::new("/usr/bin/id")
+            .args(["-g", service_user])
+            .output()?;
+        if !group_id.status.success() {
+            bail!("cannot resolve service primary group ID")
+        }
+        let gid: u32 = String::from_utf8(group_id.stdout)?
+            .trim()
+            .parse()
+            .context("invalid service GID")?;
         let record = Command::new("/usr/bin/dscl")
             .args([
                 ".",
@@ -343,6 +523,28 @@ pub fn install_system_user(
         if !Path::new(home).is_absolute() {
             bail!("service account HOME must be absolute")
         }
+        if !data_dir.exists() {
+            let status = Command::new("/usr/bin/sudo")
+                .args([
+                    "-n",
+                    "-u",
+                    service_user,
+                    "--",
+                    "/bin/mkdir",
+                    "-p",
+                    "-m",
+                    "700",
+                ])
+                .arg(data_dir)
+                .status()?;
+            if !status.success() {
+                bail!(
+                    "cannot create data directory as service user: {}",
+                    data_dir.display()
+                )
+            }
+        }
+        prepare_service_data(data_dir, uid)?;
         // Check real access as the target account before touching a running service.
         for (flag, path) in [
             ("-r", token_file),
@@ -362,11 +564,25 @@ pub fn install_system_user(
         let path = format!(
             "{home}/.local/bin:{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         );
-        let plist = launch_agent(&args, &data_dir, &path, role)?
+        let log_root = Path::new("/private/var/log/ylcc");
+        let log_dir = log_root.join(service_user);
+        let plist = launch_agent(&args, &data_dir, &log_dir, &path, role)?
             .replace(&format!("<string>org.ylcc.{role}</string>"), &format!("<string>{label}</string>\n<key>UserName</key><string>{}</string>\n<key>GroupName</key><string>{}</string>", xml(service_user)?, xml(&group)?))
             .replace("<key>EnvironmentVariables</key><dict>", &format!("<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string>", xml(home)?));
-        let file = PathBuf::from("/Library/LaunchDaemons").join(format!("{label}.plist"));
-        check_managed_owner(&file, service_user)?;
+        prepare_log_directory(log_root, 0, 0o755)?;
+        prepare_launchd_logs(&log_dir, role, 0, uid, gid, 0o755)?;
+        for directory in [log_root, log_dir.as_path()] {
+            let status = Command::new("/usr/bin/sudo")
+                .args(["-n", "-u", service_user, "--", "/bin/test", "-w"])
+                .arg(directory)
+                .status()?;
+            if status.code() != Some(1) {
+                bail!(
+                    "cannot confirm service user cannot replace log files in {}",
+                    directory.display()
+                )
+            }
+        }
         let target = format!("system/{label}");
         if Command::new("launchctl")
             .args(["print", &target])
@@ -518,12 +734,14 @@ mod tests {
         let plist = launch_agent(
             &["/bin/ylcc".into(), "<&\"' >".into()],
             Path::new("/data&cache"),
+            Path::new("/private/var/log/ylcc/user&name"),
             "/bin",
             "worker",
         )
         .unwrap();
         assert!(plist.contains("&lt;&amp;&quot;&apos; &gt;"));
         assert!(plist.contains("/data&amp;cache"));
+        assert!(plist.contains("<key>StandardOutPath</key><string>/private/var/log/ylcc/user&amp;name/service-worker.log</string>"));
         assert!(!plist.contains("<string><&"));
         assert!(role_name("worker\nanything").is_err());
         #[cfg(target_os = "macos")]
@@ -539,5 +757,117 @@ mod tests {
                     .success()
             );
         }
+    }
+    #[test]
+    fn launchd_logs_are_separate_from_external_working_data() {
+        let plist = launch_agent(
+            &["/bin/ylcc".into()],
+            Path::new("/Volumes/External jobs/worker"),
+            Path::new("/Users/build/Library/Logs/ylcc"),
+            "/bin",
+            "worker",
+        )
+        .unwrap();
+        assert!(
+            plist.contains(
+                "<key>WorkingDirectory</key><string>/Volumes/External jobs/worker</string>"
+            )
+        );
+        assert!(plist.contains("<key>StandardOutPath</key><string>/Users/build/Library/Logs/ylcc/service-worker.log</string>"));
+        assert!(plist.contains("<key>StandardErrorPath</key><string>/Users/build/Library/Logs/ylcc/service-worker.err.log</string>"));
+        assert!(!plist.contains("/Volumes/External jobs/worker/service-"));
+        for path in [
+            "relative",
+            "/logs/../other",
+            "/logs\nother",
+            "/logs\0other",
+            "/logs\u{1}other",
+        ] {
+            assert!(
+                launch_agent(&[], Path::new("/data"), Path::new(path), "/bin", "worker").is_err()
+            );
+        }
+    }
+    #[test]
+    fn launchd_logs_reject_unsafe_paths_and_owners_without_overwriting() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let logs = root.join("logs");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        prepare_launchd_logs(&logs, "worker", uid, uid, gid, 0o700).unwrap();
+        assert_eq!(fs::metadata(&logs).unwrap().mode() & 0o777, 0o700);
+        let output = logs.join("service-worker.log");
+        let metadata = fs::metadata(&output).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (uid, gid, 0o600)
+        );
+        fs::write(&output, "existing log").unwrap();
+        prepare_launchd_logs(&logs, "worker", uid, uid, gid, 0o700).unwrap();
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing log");
+        assert!(
+            prepare_launchd_logs(&logs, "worker", uid, uid.wrapping_add(1), gid, 0o700).is_err()
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing log");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(prepare_launchd_logs(&logs, "worker", uid, uid, gid, 0o700).is_err());
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let victim = root.join("valuable");
+        fs::write(&victim, "untouched").unwrap();
+        let unsafe_log = logs.join("service-hub.log");
+        symlink(&victim, &unsafe_log).unwrap();
+        assert!(prepare_launchd_logs(&logs, "hub", uid, uid, gid, 0o700).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        fs::remove_file(&unsafe_log).unwrap();
+        fs::create_dir(&unsafe_log).unwrap();
+        assert!(prepare_launchd_logs(&logs, "hub", uid, uid, gid, 0o700).is_err());
+        fs::remove_dir(&unsafe_log).unwrap();
+        fs::hard_link(&victim, &unsafe_log).unwrap();
+        assert!(prepare_launchd_logs(&logs, "hub", uid, uid, gid, 0o700).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+
+        let link = root.join("linked-directory");
+        symlink(&logs, &link).unwrap();
+        assert!(prepare_launchd_logs(&link, "worker", uid, uid, gid, 0o700).is_err());
+        assert!(prepare_log_directory(&logs, uid.wrapping_add(1), 0o700).is_err());
+        let insecure = root.join("insecure-parent");
+        fs::create_dir(&insecure).unwrap();
+        fs::set_permissions(&insecure, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            prepare_launchd_logs(&insecure.join("logs"), "worker", uid, uid, gid, 0o700).is_err()
+        );
+        assert!(!insecure.join("logs").exists());
+    }
+    #[test]
+    fn service_data_preparation_preserves_owned_targets_and_rejects_foreign_owners() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("worker");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(directory.join("retained"), "keep").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(prepare_service_data(&directory, uid.wrapping_add(1)).is_err());
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o755);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o000)).unwrap();
+        prepare_service_data(&directory, uid).unwrap();
+        let before = fs::metadata(&directory).unwrap();
+        assert_eq!(before.mode() & 0o7777, 0o700);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let link = temporary.path().join("configured-link");
+        symlink(&directory, &link).unwrap();
+        prepare_service_data(&link, uid).unwrap();
+        let after = fs::metadata(&directory).unwrap();
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("retained")).unwrap(),
+            "keep"
+        );
     }
 }

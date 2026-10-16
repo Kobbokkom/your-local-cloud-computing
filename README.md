@@ -38,8 +38,8 @@ This is a pool for trusted people and trusted code. Native jobs have the worker 
 Download a versioned binary for Linux/macOS on x86_64/arm64. The installer verifies the archive against the release's `SHA256SUMS` before installing it:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.1.2/scripts/install.sh -o /tmp/ylcc-install.sh
-bash /tmp/ylcc-install.sh --version v0.1.2
+curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.1.3/scripts/install.sh -o /tmp/ylcc-install.sh
+bash /tmp/ylcc-install.sh --version v0.1.3
 export PATH="$HOME/.local/bin:$PATH"
 ylcc --version
 ```
@@ -51,9 +51,9 @@ Use `--prefix /your/prefix` to change the install location. You can also downloa
 The binary installer installs the executable and license notices. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
 
 ```bash
-export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.2"
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.1.3"
 mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
-git clone --depth 1 --branch v0.1.2 \
+git clone --depth 1 --branch v0.1.3 \
   https://github.com/semanticist21/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
 ```
 
@@ -174,7 +174,7 @@ ylcc service install --role hub --listen 127.0.0.1:7443 --data-dir "$HOME/.local
 
 Linux uses `systemd --user`: inspect `systemctl --user status ylcc-worker` and `journalctl --user -u ylcc-worker`. An administrator must enable linger with `loginctl enable-linger SERVICE_USER` for startup without login. Installing from a shell requires a working user manager/session bus.
 
-macOS uses a login LaunchAgent by default: `launchctl print gui/$(id -u)/org.ylcc.worker`. Logs are in the selected data directory. The user must log in and any external data volume must be mounted. For a dedicated headless account, an administrator can use `service install --system-user SERVICE_USER ...` to install a LaunchDaemon running as that user. Prepare an existing user-owned data directory and readable protected token first:
+macOS uses a login LaunchAgent by default: `launchctl print gui/$(id -u)/org.ylcc.worker`. Its stdout/stderr logs are `$HOME/Library/Logs/ylcc/service-ROLE.log` and `service-ROLE.err.log`. The user must log in and any external data volume must be mounted. For a dedicated headless account, an administrator can use `service install --system-user SERVICE_USER ...` to install a LaunchDaemon running as that user. System-user logs use `/private/var/log/ylcc/SERVICE_USER/`, with root-owned directories and service-user-owned mode-600 regular files. Prepare an existing user-owned data directory and readable protected token first:
 
 ```bash
 sudo /absolute/path/to/ylcc --hub https://HUB.example.ts.net:10000 \
@@ -184,6 +184,8 @@ sudo /absolute/path/to/ylcc --hub https://HUB.example.ts.net:10000 \
 ```
 
 Service installation captures the current executable location and native user's `PATH`; keep the binary there. System-user macOS installs set a user-specific `HOME` and a standard tool path. After changing tool paths, reinstall the service and verify capabilities under the service account. Updates should wait until active jobs finish before restarting a worker. Never replace running environments mid-job.
+
+Keep launchd stdout/stderr logs on the internal system volume, separate from external job data. macOS can reject opening log paths on removable volumes before starting the executable, producing `posix_spawn: Operation not permitted` or `EX_CONFIG` (78) without a worker log. Check the plist's `StandardOutPath`/`StandardErrorPath` and `launchctl print` when diagnosing this failure; readable external tokens and a valid working directory do not establish that launchd can open those log paths.
 
 An external Mac volume with “Ignore ownership” enabled (`noowners`) cannot enforce this account isolation. A plaintext sparsebundle on that volume does not fix it: other local accounts can read or modify the backing bands regardless of permissions inside the mounted image.
 
@@ -221,7 +223,7 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-worker --resta
   --user "$YLCC_UID:$YLCC_GID" \
   --mount "type=bind,src=$YLCC_DATA_DIR/worker,dst=/data" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ghcr.io/semanticist21/your-local-cloud-computing:0.1.2 \
+  ghcr.io/semanticist21/your-local-cloud-computing:0.1.3 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
@@ -236,7 +238,7 @@ Native workers can use an already configured Docker or Podman runtime; verify it
 mkdir -p "$YLCC_SUPPORT_DIR/dist"
 # Extract the verified Linux release archive for the runtime CPU; arm64 example:
 tar -xzf /path/to/ylcc-linux-aarch64.tar.gz -C "$YLCC_SUPPORT_DIR/dist"
-docker --context "$YLCC_DOCKER_CONTEXT" build --target runtime-client -t ylcc-runtime-client:0.1.2 \
+docker --context "$YLCC_DOCKER_CONTEXT" build --target runtime-client -t ylcc-runtime-client:0.1.3 \
   -f "$YLCC_SUPPORT_DIR/Dockerfile" "$YLCC_SUPPORT_DIR"
 ```
 
@@ -253,7 +255,7 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-runtime-worker
   --mount "type=bind,src=$YLCC_RUNTIME_SOCKET,dst=/var/run/docker.sock" \
   --mount "type=bind,src=$YLCC_RUNTIME_DATA,dst=$YLCC_RUNTIME_DATA" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ylcc-runtime-client:0.1.2 \
+  ylcc-runtime-client:0.1.3 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id runtime-worker --data-dir "$YLCC_RUNTIME_DATA" --max-jobs 1
 ```
@@ -314,7 +316,7 @@ From the [support checkout](#download-examples-and-agent-support-files), the [CU
 )
 ```
 
-macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.1.2.
+macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.1.3.
 
 ## Diagnose and develop
 
@@ -331,4 +333,4 @@ macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requestin
 
 CI builds/tests on native Linux x86_64, Linux arm64, Intel macOS and Apple Silicon macOS. Release automation creates four archives, checksums, a multi-platform image and a draft GitHub Release for final real-machine validation. Published release availability and successful local hardware tests are separate checks.
 
-YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.1.2 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.
+YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.1.3 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.
