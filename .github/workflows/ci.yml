@@ -26,3 +26,38 @@ jobs:
       - run: bash scripts/test-install.sh
       - name: CLI smoke test
         run: target/release/ylcc --help && target/release/ylcc --version
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust stable
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: python tests/e2e.py target/debug/ylcc.exe
+      - name: Windows PowerShell 5.1 installer checks
+        shell: powershell
+        run: ./scripts/test-install.ps1
+      - name: CLI smoke test
+        run: |
+          ./target/debug/ylcc.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./target/debug/ylcc.exe --version
+      - run: cargo build --locked --release
+      - name: Package Windows preview for real-machine validation
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/ylcc.exe,LICENSE,THIRD_PARTY_NOTICES.txt dist/
+          Compress-Archive -Path dist/ylcc.exe,dist/LICENSE,dist/THIRD_PARTY_NOTICES.txt -DestinationPath ylcc-windows-x86_64.zip
+          $hash = (Get-FileHash ylcc-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS'), "$hash  ylcc-windows-x86_64.zip`n")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ylcc-windows-x86_64-preview
+          path: |
+            ylcc-windows-x86_64.zip
+            SHA256SUMS
+          if-no-files-found: error

@@ -1,12 +1,14 @@
-use crate::model::{FileEntry, safe_relative};
+use crate::{
+    model::{FileEntry, safe_relative},
+    platform,
+};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -51,6 +53,7 @@ fn collect_git_paths(
     repository: &Path,
     dirs: &[PathBuf],
     selected: &mut BTreeSet<String>,
+    executable: &mut BTreeSet<String>,
     excluded: &mut Vec<Excluded>,
 ) -> Result<bool> {
     let Some(paths) = git_paths(repository, false) else {
@@ -64,6 +67,19 @@ fn collect_git_paths(
         .output()?;
     anyhow::ensure!(staged.status.success(), "could not inspect Git submodules");
     let staged = String::from_utf8(staged.stdout).context("Git path is not UTF-8")?;
+    for entry in staged
+        .split('\0')
+        .filter(|entry| entry.starts_with("100755 "))
+    {
+        if let Some((_, name)) = entry.split_once('\t') {
+            let path = prefix.join(name);
+            if in_selection(&path, dirs)
+                || platform::relative_path(&path).is_ok_and(|name| selected.contains(&name))
+            {
+                executable.insert(platform::relative_path(&path)?);
+            }
+        }
+    }
     let submodules: BTreeSet<_> = staged
         .split('\0')
         .filter(|entry| entry.starts_with("160000 "))
@@ -75,16 +91,16 @@ fn collect_git_paths(
         }
         let path = prefix.join(name);
         if in_selection(&path, dirs) {
-            selected.insert(path.to_str().context("Git path is not UTF-8")?.into());
+            selected.insert(platform::relative_path(&path)?);
         }
     }
     if let Some(paths) = git_paths(repository, true) {
         for name in paths {
             let path = prefix.join(name);
-            let name = path.to_str().context("Git path is not UTF-8")?;
-            if in_selection(&path, dirs) && !selected.contains(name) {
+            let name = platform::relative_path(&path)?;
+            if in_selection(&path, dirs) && !selected.contains(&name) {
                 excluded.push(Excluded {
-                    path: name.into(),
+                    path: name,
                     reason: "Git ignore rule".into(),
                 });
             }
@@ -97,9 +113,9 @@ fn collect_git_paths(
             continue;
         }
         let module = root.join(&path);
-        if fs::symlink_metadata(&module).is_ok_and(|m| m.file_type().is_symlink()) {
+        if fs::symlink_metadata(&module).is_ok_and(|m| platform::is_link(&m)) {
             excluded.push(Excluded {
-                path: path.to_str().context("Git path is not UTF-8")?.into(),
+                path: platform::relative_path(&path)?,
                 reason: "submodule is a symlink; symlinks are not followed".into(),
             });
             continue;
@@ -110,7 +126,7 @@ fn collect_git_paths(
             path.display()
         );
         anyhow::ensure!(
-            module.canonicalize()?.starts_with(root),
+            platform::command_path(&module.canonicalize()?).starts_with(root),
             "submodule escaped project root: {}",
             path.display()
         );
@@ -125,7 +141,7 @@ fn collect_git_paths(
             path.display()
         );
         anyhow::ensure!(
-            collect_git_paths(root, &module, dirs, selected, excluded)?,
+            collect_git_paths(root, &module, dirs, selected, executable, excluded)?,
             "could not read submodule {}; run git submodule update --init --recursive before submitting",
             path.display()
         );
@@ -134,14 +150,16 @@ fn collect_git_paths(
 }
 
 pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> {
-    let root = root.canonicalize()?;
+    let root = platform::command_path(&root.canonicalize()?);
     if !whole && inputs.is_empty() {
         bail!("select --input files/folders, or explicitly use --project")
     }
     let blobs = tempfile::Builder::new()
         .prefix("ylcc-snapshot-")
         .tempdir()?;
+    platform::private_dir(blobs.path())?;
     let mut selected = BTreeSet::new();
+    let mut executable = BTreeSet::new();
     let mut dirs = Vec::new();
     let mut excluded = Vec::new();
     if whole {
@@ -149,7 +167,7 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
     }
     for p in inputs {
         let abs = if p.is_absolute() {
-            p.clone()
+            platform::command_path(p)
         } else {
             root.join(p)
         };
@@ -160,21 +178,27 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
             dirs.push(PathBuf::new());
             continue;
         }
-        let name = rel.to_str().context("input path is not UTF-8")?;
-        safe_relative(name)?;
+        let name = platform::relative_path(rel)?;
         let meta = fs::symlink_metadata(&abs).with_context(|| format!("input {}", p.display()))?;
-        if meta.file_type().is_symlink() {
+        if platform::is_link(&meta) {
             bail!("explicit symlink input is not supported: {name}")
         }
         if meta.is_file() {
-            selected.insert(name.to_string());
+            selected.insert(name);
         } else if meta.is_dir() {
             dirs.push(rel.to_path_buf());
         } else {
             bail!("input is not a regular file or directory: {name}")
         }
     }
-    if !collect_git_paths(&root, &root, &dirs, &mut selected, &mut excluded)? {
+    if !collect_git_paths(
+        &root,
+        &root,
+        &dirs,
+        &mut selected,
+        &mut executable,
+        &mut excluded,
+    )? {
         for dir in &dirs {
             let mut walk = ignore::WalkBuilder::new(root.join(dir));
             walk.hidden(false).require_git(false).follow_links(false);
@@ -184,11 +208,7 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
                 if p == root || e.file_type().is_some_and(|t| t.is_dir()) {
                     continue;
                 }
-                let name = p
-                    .strip_prefix(&root)?
-                    .to_str()
-                    .context("input path is not UTF-8")?
-                    .to_string();
+                let name = platform::relative_path(p.strip_prefix(&root)?)?;
                 selected.insert(name);
             }
         }
@@ -196,10 +216,11 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
     let mut files = Vec::new();
     for name in selected {
         safe_relative(&name)?;
-        if Path::new(&name)
-            .components()
-            .any(|c| c.as_os_str() == ".git")
-        {
+        if Path::new(&name).components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+        }) {
             excluded.push(Excluded {
                 path: name,
                 reason: "Git internal data".into(),
@@ -218,20 +239,17 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
             }
             Err(e) => return Err(e.into()),
         };
-        if !meta.is_file() || meta.file_type().is_symlink() {
+        if !meta.is_file() || platform::is_link(&meta) {
             excluded.push(Excluded {
                 path: name,
                 reason: "not a regular file; symlinks are not followed".into(),
             });
             continue;
         }
-        if !path.canonicalize()?.starts_with(&root) {
+        if !platform::command_path(&path.canonicalize()?).starts_with(&root) {
             bail!("input escaped root: {name}")
         }
-        let mut input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let mut input = platform::open_input(&path)?;
         let before = input.metadata()?;
         let mut tmp = tempfile::NamedTempFile::new_in(blobs.path())?;
         let mut hasher = Sha256::new();
@@ -246,13 +264,8 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
             hasher.update(&buf[..n]);
             size += n as u64;
         }
-        let after = input.metadata()?;
-        let current = fs::symlink_metadata(&path)?;
-        if size != before.len()
-            || before.mtime() != after.mtime()
-            || before.mtime_nsec() != after.mtime_nsec()
-            || before.ino() != current.ino()
-            || before.len() != current.len()
+        if !platform::unchanged(&input, &before, &path, size)?
+            || !platform::command_path(&path.canonicalize()?).starts_with(&root)
         {
             bail!("input changed while creating snapshot: {name}; submit again")
         }
@@ -260,13 +273,19 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
         let dest = blobs.path().join(&hash);
         if !dest.exists() {
             tmp.persist(&dest)?;
-            fs::set_permissions(&dest, fs::Permissions::from_mode(0o400))?;
+            #[cfg(unix)]
+            platform::set_mode(&File::open(&dest)?, 0o400)?;
         }
+        let mode = if cfg!(windows) && executable.contains(&name) {
+            0o755
+        } else {
+            platform::mode(&before)
+        };
         files.push(FileEntry {
             path: name,
             hash,
             size,
-            mode: before.permissions().mode() & 0o777,
+            mode,
         });
     }
     Ok(Snapshot {
@@ -294,9 +313,12 @@ pub fn ensure_safe_directory(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(m) => {
-                if m.file_type().is_symlink() || !m.is_dir() {
+                if platform::is_link(&m) || !m.is_dir() {
                     bail!(
                         "result directory contains non-directory or symlink: {}",
                         current.display()
@@ -394,10 +416,11 @@ mod tests {
         fs::write(d.path().join("gone"), "x").unwrap();
         git(d.path(), &["add", "gone"]);
         fs::remove_file(d.path().join("gone")).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", d.path().join("link")).unwrap();
         let s = create(d.path(), &[], true).unwrap();
         assert!(s.files.is_empty());
-        assert_eq!(s.excluded.len(), 2);
+        assert_eq!(s.excluded.len(), if cfg!(unix) { 2 } else { 1 });
     }
     #[test]
     fn nested_directory_scope() {
@@ -441,6 +464,7 @@ mod tests {
         fs::write(nested.join("tracked"), "nested dirty").unwrap();
         fs::write(nested.join("new"), "nested untracked").unwrap();
         fs::write(nested.join("ignored"), "not included").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&leaf, module.join("outside")).unwrap();
         let snapshot = create(&project, &[], true).unwrap();
         for (path, contents) in [
@@ -497,9 +521,50 @@ mod tests {
         assert_eq!(selected.files[0].path, "tracked");
     }
     #[test]
+    #[cfg(unix)]
     fn result_parent_symlink_rejected() {
         let d = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/tmp", d.path().join("evil")).unwrap();
         assert!(ensure_safe_directory(&d.path().join("evil/sub")).is_err());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn snapshots_native_separators_as_portable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        fs::write(dir.path().join("src/sub/input.txt"), "input").unwrap();
+        let snapshot = create(dir.path(), &[r"src\sub\input.txt".into()], false).unwrap();
+        assert_eq!(snapshot.files[0].path, "src/sub/input.txt");
+    }
+    #[test]
+    #[cfg(windows)]
+    fn snapshots_preserve_git_executable_bits_for_unix_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        fs::write(dir.path().join("script.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        git(dir.path(), &["add", "script.sh"]);
+        git(dir.path(), &["update-index", "--chmod=+x", "script.sh"]);
+        let snapshot = create(dir.path(), &["script.sh".into()], false).unwrap();
+        assert_eq!(snapshot.files[0].mode, 0o755);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn junction_inputs_and_result_parents_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("private.txt"), "private").unwrap();
+        assert!(
+            Command::new("cmd.exe")
+                .args(["/c", "mklink", "/J"])
+                .arg(dir.path().join("junction"))
+                .arg(outside.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(create(dir.path(), &["junction".into()], false).is_err());
+        assert!(create(dir.path(), &["junction/private.txt".into()], false).is_err());
+        assert!(ensure_safe_directory(&dir.path().join("junction/results")).is_err());
+        fs::remove_dir(dir.path().join("junction")).unwrap();
     }
 }

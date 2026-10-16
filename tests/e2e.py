@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -31,7 +32,8 @@ def main():
         (project / "input.txt").write_text("41\n")
         (project / "ignored.txt").write_text("explicit only\n")
         (project / "main.c").write_text('#include <stdio.h>\nint main(void){int n;if(scanf("%d",&n)!=1)return 2;printf("%d\\n",n+1);return 0;}\n')
-        subprocess.run(["git", "-C", str(project), "add", "input.txt", "main.c", ".gitignore"], check=True)
+        (project / "main.rs").write_text('use std::io::{self, Read}; fn main() { let mut s = String::new(); io::stdin().read_to_string(&mut s).unwrap(); println!("{}", s.trim().parse::<i32>().unwrap() + 1); }\n')
+        subprocess.run(["git", "-C", str(project), "add", "input.txt", "main.c", "main.rs", ".gitignore"], check=True)
         (project / "input.txt").write_text("42\n")
         processes = []
         streams = []
@@ -39,7 +41,7 @@ def main():
         def start(role, *args):
             stream = (base / f"{role}-{len(streams)}.log").open("w+")
             streams.append(stream)
-            process = subprocess.Popen(prefix + [role, *args], stdout=stream, stderr=stream, start_new_session=True)
+            process = subprocess.Popen(prefix + [role, *args], stdout=stream, stderr=stream, start_new_session=os.name != "nt")
             processes.append(process)
             return process
 
@@ -76,6 +78,10 @@ def main():
 
         def stop(process):
             if process.poll() is None:
+                if os.name == "nt":
+                    process.terminate()
+                    process.wait(timeout=10)
+                    return
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
                     process.wait(timeout=10)
@@ -83,16 +89,47 @@ def main():
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
 
+        def python(code):
+            return [sys.executable, "-c", code]
+
+        copy_input = "from pathlib import Path; Path('answer.txt').write_bytes(Path('input.txt').read_bytes())"
+        noop = python("pass")
+
+        def process_alive(pid):
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                kernel.OpenProcess.restype = wintypes.HANDLE
+                kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                handle = kernel.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    error = ctypes.get_last_error()
+                    if error in (87, 1168):
+                        return False
+                    raise ctypes.WinError(error)
+                try:
+                    code = wintypes.DWORD()
+                    if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    return code.value == 259
+                finally:
+                    kernel.CloseHandle(handle)
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+            return bool(status.stdout.strip()) and not status.stdout.strip().startswith("Z")
+
         try:
             hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
             until(lambda: cli("workers")[0] == [])
             worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"))
             until(lambda: any(w["online"] for w in cli("workers")[0]))
-            os_name = "macos" if sys.platform == "darwin" else "linux"
+            os_name = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
             arch = "aarch64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
             common = ["--os", os_name, "--arch", arch]
 
-            empty, _ = cli("run", "--no-input", *common, "--", "true")
+            empty, _ = cli("run", "--no-input", *common, "--", *noop)
             assert empty["state"] == "succeeded" and not empty["spec"]["inputs"]
 
             manifest, _ = cli("manifest", "--project")
@@ -101,34 +138,42 @@ def main():
             explicit, _ = cli("manifest", "--input", "ignored.txt")
             assert [f["path"] for f in explicit["files"]] == ["ignored.txt"]
 
-            first, _ = cli("run", "--project", "--output", "answer.txt", *common, "--tool", "cc=*", "--", "sh", "-c", "cc main.c -o app && ./app < input.txt > answer.txt")
+            if os.name == "nt":
+                compile_command = python("import subprocess; from pathlib import Path; subprocess.run(['rustc', 'main.rs', '-o', 'app.exe'], check=True); Path('answer.txt').write_bytes(subprocess.check_output(['./app.exe'], input=Path('input.txt').read_bytes()))")
+                compiler = "rustc=*"
+            else:
+                compile_command = ["sh", "-c", "cc main.c -o app && ./app < input.txt > answer.txt"]
+                compiler = "cc=*"
+            first, _ = cli("run", "--project", "--output", "answer.txt", *common, "--tool", compiler, "--", *compile_command)
             assert first["state"] == "succeeded" and result(first) == "43\n"
             assert first["worker_id"] == "test-worker"
             assert not (project / "answer.txt").exists()
-            assert hashlib.sha256(result(first).encode()).hexdigest() == first["results"][0]["hash"]
-            second, transfer = cli("run", "--project", "--output", "answer.txt", *common, "--", "sh", "-c", "cat input.txt > answer.txt")
+            assert hashlib.sha256((base / "results" / first["id"] / "answer.txt").read_bytes()).hexdigest() == first["results"][0]["hash"]
+            second, transfer = cli("run", "--project", "--output", "answer.txt", *common, "--", *python(copy_input))
             assert "uploaded 0 missing blobs (0 bytes)" in transfer
 
-            frozen, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--detach", "--", "sh", "-c", "sleep 2; cat input.txt > answer.txt")
+            frozen, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--detach", "--", *python("import time; time.sleep(2); " + copy_input))
             (project / "input.txt").write_text("99\n")
             assert result(wait(frozen)) == "42\n"
-            changed, transfer = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--", "sh", "-c", "test ! -e main.c; cat input.txt > answer.txt")
+            changed, transfer = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--", *python("from pathlib import Path; assert not Path('main.c').exists(); " + copy_input))
             assert result(changed) == "99\n" and "uploaded 1 missing blobs" in transfer
-            rejected = cli("run", "--input", "input.txt", "--arch", "impossible-cpu", "--", "true", ok=False)
+            rejected = cli("run", "--input", "input.txt", "--arch", "impossible-cpu", "--", *noop, ok=False)
             assert "no compatible" in rejected.stderr
 
-            busy, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", "sleep", "3")
-            queued, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", "true")
+            busy, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", *python("import time; time.sleep(3)"))
+            queued, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", *noop)
             assert queued["state"] == "queued"
             wait(busy)
             wait(queued)
 
-            cancel, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", "sh", "-c", "sleep 60 & wait")
+            cancel, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", *python("import subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print('childpid='+str(child.pid),flush=True); time.sleep(60)"))
             until(lambda: state(cancel)["state"] == "running")
+            child_pid = until(lambda: re.search(r"childpid=(\d+)", "".join(line["text"] for line in cli("jobs", "logs", cancel["id"])[0])))
             cli("jobs", "cancel", cancel["id"])
             until(lambda: state(cancel)["state"] == "cancelled", timeout=15)
+            until(lambda: not process_alive(int(child_pid[1])), timeout=15)
 
-            reconnect, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--detach", "--", "sh", "-c", "printf start; sleep 5; printf done > answer.txt")
+            reconnect, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--detach", "--", *python("import time; from pathlib import Path; print('start',flush=True); time.sleep(5); Path('answer.txt').write_bytes(b'done')"))
             until(lambda: state(reconnect)["state"] == "running")
             stop(hub)
             time.sleep(1)
@@ -140,32 +185,31 @@ def main():
             assert len({line["seq"] for line in logs}) == len(logs)
             assert "".join(line["text"] for line in logs).count("start") == 1
 
-            environment = {"id": "test-tools", "revision": "v1", "requirements": {"os": os_name, "arch": arch}, "setup": ['mkdir -p "$YLCC_ENV_DIR/bin"; printf \'#!/bin/sh\\nprintf prepared\\n\' > "$YLCC_ENV_DIR/bin/prepared"; chmod +x "$YLCC_ENV_DIR/bin/prepared"'], "verify": ['test "$(prepared)" = prepared']}
+            if os.name == "nt":
+                setup = 'New-Item -ItemType Directory -Force -Path "$env:YLCC_ENV_DIR\\bin" | Out-Null; [System.IO.File]::WriteAllText("$env:YLCC_ENV_DIR\\bin\\prepared.cmd", "@echo prepared")'
+                verify = "if ((cmd.exe /d /c prepared).Trim() -ne 'prepared') { exit 1 }"
+                prepared_command = python("import subprocess; from pathlib import Path; Path('answer.txt').write_bytes(subprocess.check_output(['cmd.exe','/d','/c','prepared']).strip())")
+            else:
+                setup = 'mkdir -p "$YLCC_ENV_DIR/bin"; printf \'#!/bin/sh\\nprintf prepared\\n\' > "$YLCC_ENV_DIR/bin/prepared"; chmod +x "$YLCC_ENV_DIR/bin/prepared"'
+                verify = 'test "$(prepared)" = prepared'
+                prepared_command = ["sh", "-c", "prepared > answer.txt"]
+            environment = {"id": "test-tools", "revision": "v1", "requirements": {"os": os_name, "arch": arch}, "setup": [setup], "verify": [verify]}
             environment_file = base / "environment.json"
             environment_file.write_text(json.dumps(environment))
             cli("env", "add", str(environment_file))
-            prepared, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--environment", "test-tools", "--", "sh", "-c", "prepared > answer.txt")
+            prepared, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--environment", "test-tools", "--", *prepared_command)
             assert result(prepared) == "prepared"
             statuses, _ = cli("env", "status")
             assert any(s["state"] == "ready" and s["revision"] == "v1" for s in statuses)
             stop(worker)
             worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"))
             until(lambda: any(w["online"] for w in cli("workers")[0]))
-            reused, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--environment", "test-tools", "--", "sh", "-c", "prepared > answer.txt")
+            reused, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--environment", "test-tools", "--", *prepared_command)
             assert result(reused) == "prepared"
 
             # A reviewed project task must resolve inputs at its own file, not the caller's cwd.
             project_file = project / "ylcc.yaml"
-            project_file.write_text(f'''version: 1
-tasks:
-  copy:
-    command: [sh, -c, "cat input.txt > answer.txt"]
-    inputs: [input.txt]
-    outputs: [answer.txt]
-    requirements: {{os: {os_name}, arch: {arch}}}
-    priority: 10
-    timeout_secs: 30
-''')
+            project_file.write_text(json.dumps({"version": 1, "tasks": {"copy": {"command": python(copy_input), "inputs": ["input.txt"], "outputs": ["answer.txt"], "requirements": {"os": os_name, "arch": arch}, "priority": 10, "timeout_secs": 30}}}))
             task = subprocess.run(prefix + ["task", "run", "copy", "--file", str(project_file)],
                                   cwd=base, text=True, capture_output=True, timeout=90)
             assert task.returncode == 0, task.stderr
@@ -173,8 +217,8 @@ tasks:
 
             paused, _ = cli("workers", "pause", "test-worker")
             assert paused["paused"]
-            low, _ = cli("run", "--no-input", *common, "--detach", "--", "true")
-            high, _ = cli("run", "--no-input", *common, "--detach", "--", "sleep", "2")
+            low, _ = cli("run", "--no-input", *common, "--detach", "--", *noop)
+            high, _ = cli("run", "--no-input", *common, "--detach", "--", *python("import time; time.sleep(2)"))
             reprioritized, _ = cli("jobs", "priority", high["id"], "20")
             assert reprioritized["spec"]["priority"] == 20
             assert state(low)["state"] == state(high)["state"] == "queued"
@@ -195,8 +239,8 @@ tasks:
             wait(high)
             wait(low)
             cli("workers", "limit", "test-worker", "--max-jobs", "2")
-            parallel_a, _ = cli("run", "--no-input", *common, "--detach", "--", "sleep", "3")
-            parallel_b, _ = cli("run", "--no-input", *common, "--detach", "--", "sleep", "3")
+            parallel_a, _ = cli("run", "--no-input", *common, "--detach", "--", *python("import time; time.sleep(3)"))
+            parallel_b, _ = cli("run", "--no-input", *common, "--detach", "--", *python("import time; time.sleep(3)"))
             until(lambda: state(parallel_a)["state"] == state(parallel_b)["state"] == "running")
             cli("workers", "limit", "test-worker", "--max-jobs", "1")
             assert state(parallel_a)["state"] == state(parallel_b)["state"] == "running"

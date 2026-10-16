@@ -78,6 +78,7 @@ struct WorkerSettings {
 }
 
 fn identifier(value: &str) -> Result<()> {
+    safe_relative(value)?;
     if value.is_empty()
         || value.len() > 128
         || !value.as_bytes()[0].is_ascii_alphanumeric()
@@ -898,10 +899,7 @@ fn incompatibilities(
 }
 
 pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Result<()> {
-    let token = std::fs::read_to_string(token_file)?.trim().to_owned();
-    if token.len() < 16 || token.chars().any(char::is_whitespace) {
-        bail!("token file must contain one token of at least 16 characters")
-    }
+    let token = crate::client::read_token(&token_file)?;
     let state = Arc::new(Mutex::new(Store::open(data_dir, token)?));
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;

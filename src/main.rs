@@ -5,15 +5,14 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
-use ylcc::{client::Client, model::*, project::Project, snapshot};
+use ylcc::{client::Client, model::*, platform, project::Project, snapshot};
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Run workloads across your own Linux and macOS machines"
+    about = "Run workloads across your own Linux, macOS and Windows machines"
 )]
 struct Cli {
     #[arg(long, global = true, env = "YLCC_HUB_URL")]
@@ -252,17 +251,32 @@ struct Config {
 }
 fn home() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .expect("HOME must be set")
+        .expect("HOME or USERPROFILE must be set")
 }
 fn config_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("APPDATA")
+            } else {
+                None
+            }
+        })
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
         .join("ylcc/config.json")
 }
 fn data_path() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("LOCALAPPDATA")
+            } else {
+                None
+            }
+        })
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/share"))
         .join("ylcc")
@@ -385,14 +399,9 @@ async fn execute() -> Result<()> {
                 .parent()
                 .context("token file needs a parent directory")?;
             fs::create_dir_all(parent)?;
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&token)
-                .context(
-                    "token file exists or cannot be created; existing tokens are never replaced",
-                )?;
+            let mut f = platform::create_private_file(&token).context(
+                "token file exists or cannot be created; existing tokens are never replaced",
+            )?;
             writeln!(
                 f,
                 "{}{}",
@@ -406,10 +415,9 @@ async fn execute() -> Result<()> {
             ylcc::client::read_token(&token)?;
             let token = absolute_path(&token)?;
             let results = absolute_path(&results)?;
-            fs::create_dir_all(cfg_path.parent().unwrap())?;
+            platform::private_dir(cfg_path.parent().unwrap())?;
             let mut temp = tempfile::NamedTempFile::new_in(cfg_path.parent().unwrap())?;
-            temp.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))?;
+            platform::protect_file(temp.as_file())?;
             temp.write_all(&serde_json::to_vec_pretty(&Config {
                 hub: Some(hub),
                 token_file: Some(token),
@@ -736,10 +744,7 @@ mod tests {
 
     fn test_token() -> tempfile::NamedTempFile {
         let mut token = tempfile::NamedTempFile::new().unwrap();
-        token
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .unwrap();
+        platform::protect_file(token.as_file()).unwrap();
         writeln!(token, "{}", "a".repeat(64)).unwrap();
         token
     }

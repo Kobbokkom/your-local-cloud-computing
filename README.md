@@ -6,7 +6,7 @@
 
 **Put your other computers to work.**
 
-Run builds, tests, rendering and GPU workloads across your own Linux and macOS machines, from a CLI or coding agent.
+Run builds, tests, rendering and GPU workloads across your own Linux, macOS and Windows machines, from a CLI or coding agent.
 
 [Quick start](#quick-start) · [Agents](#use-from-an-agent) · [Containers](#docker-and-podman) · [Environments](#reusable-environments) · [MIT](LICENSE)
 
@@ -20,8 +20,10 @@ flowchart LR
     A <-->|"HTTPS · missing content + results"| H
     W1["Linux worker · x86_64 / arm64"] <-->|"Outbound WebSocket · jobs / logs / status"| H
     W2["macOS worker · Intel / Apple Silicon"] <-->|"Outbound WebSocket · jobs / logs / status"| H
+    W3["Windows worker · x86_64"] <-->|"Outbound WebSocket · jobs / logs / status"| H
     W1 --> C["Native tools / Docker / Podman / CUDA"]
     W2 --> M["Native tools / Xcode / Metal / Linux containers"]
+    W3 --> N["Native tools / Android SDK / Windows builds"]
 ```
 
 ## What you get
@@ -69,6 +71,54 @@ cargo build --manifest-path "$YLCC_SUPPORT_DIR/Cargo.toml" --locked --release
 mkdir -p "$HOME/.local/bin"
 install -m 755 "$YLCC_SUPPORT_DIR/target/release/ylcc" "$HOME/.local/bin/ylcc"
 ```
+
+## Windows CLI and worker
+
+Windows support is new in the source checkout. Published **v0.2.0 has no Windows binary**; use a checkout containing this support until a Windows release is published. Native Windows x86_64 is supported; Windows arm64 release artifacts and a Windows Hub background service are not provided. The Hub can stay on Linux/macOS. Windows uses the same outward HTTPS/WebSocket connection and shared token; SSH, WSL and Docker are not required.
+
+To build from source, install [Rust's MSVC toolchain](https://rust-lang.org/tools/install/) and Visual Studio Build Tools with the C++ desktop workload and Windows SDK (SQLite is bundled). In PowerShell, from this checkout:
+
+```powershell
+cargo build --locked --release
+$ylcc = (Resolve-Path .\target\release\ylcc.exe).Path
+& $ylcc --version
+```
+
+For a published Windows release, `scripts/install.ps1 -Version RELEASE_TAG` detects x86_64, checks `SHA256SUMS` and validates the ZIP before installing to `$env:LOCALAPPDATA\Programs\ylcc\bin`. It installs the executable and licenses without changing PATH. Choose a release whose assets actually include `ylcc-windows-x86_64.zip`; the v0.2.0 assets do not. Keep the executable at its installed location after registering a background worker. Windows prevents replacing a running executable: drain jobs and stop/uninstall the worker task before upgrading, then reinstall it with the same ID/data directory.
+
+Transfer your existing pool token through your secure administration channel to `$env:APPDATA\ylcc\token`. Restrict its ACL to your user, SYSTEM and Administrators; `ylcc init` creates a protected token only when setting up a **new** pool. Do not generate a different token on a joining worker. Then configure and start:
+
+```powershell
+$token = Join-Path $env:APPDATA 'ylcc\token'
+$data = Join-Path $env:LOCALAPPDATA 'ylcc\worker'
+& $ylcc --hub https://HUB.example.ts.net:10000 --token-file $token configure
+& $ylcc --json doctor
+& $ylcc worker --id windows-build --data-dir $data --max-jobs 1
+```
+
+After confirming the foreground connection, stop it with Ctrl+C and install the background worker from the same configured user shell:
+
+```powershell
+& $ylcc service install --role worker --id windows-build --data-dir $data --max-jobs 1
+& $ylcc --json workers
+# Inspect only this user's task and service log:
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+Get-ScheduledTask -TaskName "YLCC-worker-$sid"
+Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'ylcc\service\worker.log') -Tail 40
+# Remove automatic startup; tokens, logs and workload data are retained:
+& $ylcc service uninstall --role worker
+```
+
+This is a Task Scheduler task running as the installing user with limited privileges and an interactive logon token. It starts at that user's logon and requires the user to stay logged in; a locked session is fine. It is not a Windows SCM service and does not start before login. Local Task Scheduler policy can reject registration; the command reports the error. The task captures the installing shell's PATH. Reinstall it after changing SDK/tool paths, and check `workers` for the actual service capabilities. Use a local ACL-capable disk such as NTFS for private token/job data; filesystems without working ACL protection are rejected.
+
+From the support checkout, submit the native [PowerShell example](examples/jobs/windows-check.ps1) from any requester:
+
+```bash
+ylcc run --input examples/jobs/windows-check.ps1 --os windows --arch x86_64 \
+  --output result.json -- powershell.exe -NoProfile -NonInteractive -File examples/jobs/windows-check.ps1
+```
+
+On Windows PowerShell, put that command on one line instead of using Bash's `\` continuation. Request `windows` explicitly for Windows tools; a Linux container worker on a Windows host advertises Linux. Android builds/emulator jobs additionally require the Android SDK, Java/Gradle and emulator virtualization already configured for the worker user. Run Gradle with `--no-daemon` so the job owns its processes instead of reusing an external daemon. YLCC does not install those tools or provide interactive Android Studio remote desktop control. A build test does not establish emulator or real-device support on your particular PC.
 
 ## Quick start
 
@@ -383,6 +433,6 @@ macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requestin
 )
 ```
 
-CI builds/tests on native Linux x86_64, Linux arm64, Intel macOS and Apple Silicon macOS. Release automation creates four archives, checksums, a multi-platform image and a draft GitHub Release for final real-machine validation. Published release availability and successful local hardware tests are separate checks.
+CI builds/tests on native Linux x86_64, Linux arm64, Intel macOS, Apple Silicon macOS and Windows x86_64. Windows installer checks run under Windows PowerShell 5.1. Release automation creates four Unix archives plus a Windows ZIP, checksums, a Linux multi-platform image and a draft GitHub Release for final real-machine validation. Published release availability and successful local hardware tests are separate checks.
 
 YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.2.0 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.

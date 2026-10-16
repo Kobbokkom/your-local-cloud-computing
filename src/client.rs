@@ -1,5 +1,6 @@
 use crate::{
     model::*,
+    platform,
     snapshot::{self, Snapshot},
 };
 use anyhow::{Context, Result, bail};
@@ -8,20 +9,16 @@ use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::PermissionsExt,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio_util::io::ReaderStream;
 
 pub fn read_token(path: &Path) -> Result<String> {
-    let meta =
-        fs::metadata(path).context("read token file; run ylcc init or provide --token-file")?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        bail!("token file must be owner-only (chmod 600)")
-    }
-    let token = fs::read_to_string(path)?.trim().to_string();
+    let mut token = String::new();
+    platform::read_private_file(path)?.read_to_string(&mut token)?;
+    let token = token.trim().to_string();
     if token.len() < 32 || token.contains(char::is_whitespace) {
         bail!("token must contain at least 32 non-whitespace characters")
     };
@@ -135,7 +132,7 @@ impl Client {
         segment(&job.id)?;
         // The explicitly selected root may use OS aliases such as macOS /var -> /private/var.
         fs::create_dir_all(results_root)?;
-        let results_root = results_root.canonicalize()?;
+        let results_root = platform::command_path(&results_root.canonicalize()?);
         let dest = results_root.join(&job.id);
         snapshot::ensure_safe_directory(&dest)?;
         for f in &job.results {
@@ -144,7 +141,7 @@ impl Client {
             let target = dest.join(&f.path);
             snapshot::ensure_safe_directory(target.parent().context("result has no parent")?)?;
             if let Ok(meta) = fs::symlink_metadata(&target) {
-                if !meta.is_file() || meta.file_type().is_symlink() {
+                if !meta.is_file() || platform::is_link(&meta) {
                     bail!("refusing non-regular result destination")
                 };
                 if snapshot::hash_file(&target)? == f.hash {
@@ -178,8 +175,7 @@ impl Client {
             if size != f.size || hex::encode(hash.finalize()) != f.hash {
                 bail!("result checksum/size mismatch")
             }
-            tmp.as_file()
-                .set_permissions(fs::Permissions::from_mode(f.mode & 0o777))?;
+            platform::set_mode(tmp.as_file(), f.mode)?;
             tmp.persist_noclobber(&target)?;
         }
         Ok(dest)

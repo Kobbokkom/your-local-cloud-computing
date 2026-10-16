@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "ylcc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2085,6 +2085,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "uuid",
+ "windows-sys 0.61.2",
  "yaml_serde",
 ]
 

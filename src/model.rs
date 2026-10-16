@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    path::{Component, Path},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,24 +20,30 @@ pub fn normalize_arch(s: &str) -> String {
     .into()
 }
 pub fn safe_relative(s: &str) -> Result<()> {
-    let normalized = Path::new(s)
-        .components()
-        .filter_map(|c| {
-            if let Component::Normal(p) = c {
-                p.to_str()
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    if s.is_empty()
-        || s.contains(['\\', '\0'])
-        || normalized != s
-        || !Path::new(s)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-    {
+    // Wire paths must keep the same meaning on every worker OS, including Windows.
+    if s.split('/').any(|part| {
+        let stem = part
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.ends_with(['.', ' '])
+            || part.chars().any(|c| c < ' ' || "\\<>:\"|?*".contains(c))
+            || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
+            || stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|suffix| {
+                    matches!(
+                        suffix,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+    }) {
         bail!("unsafe relative path: {s}")
     }
     Ok(())
@@ -310,10 +315,36 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_paths() {
-        for s in ["../x", "/tmp/x", "a/../b", "a\\b", ""] {
+        for s in [
+            "../x",
+            "/tmp/x",
+            "a/../b",
+            "a\\b",
+            "",
+            "C:/temp/a",
+            "a:stream",
+            "//host/share",
+            "a//b",
+            "a/./b",
+            "a.",
+            "a ",
+            "NUL",
+            "con.txt",
+            "COM1.log",
+            "lpt9",
+            "COM¹.txt",
+            "CONIN$",
+            "con .txt",
+            "a/aux/file",
+            "a\nfile",
+            "a?b",
+            "a|b",
+        ] {
             assert!(safe_relative(s).is_err());
         }
         assert!(safe_relative("dir/a.txt").is_ok());
+        assert!(safe_relative("dir/COM10.txt").is_ok());
+        assert!(safe_relative("dir/hello world.txt").is_ok());
     }
     #[test]
     fn architecture_and_gpu_are_required() {

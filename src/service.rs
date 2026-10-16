@@ -12,6 +12,7 @@ fn checked(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+#[cfg(unix)]
 fn systemd_arg(value: &str) -> Result<String> {
     checked(value)?;
     Ok(format!(
@@ -41,6 +42,7 @@ fn role_name(role: &str) -> Result<&str> {
     }
 }
 
+#[cfg(unix)]
 fn run(command: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(command)
         .args(args)
@@ -56,12 +58,14 @@ fn run(command: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(
         env::var_os("HOME").context("HOME is required for user services")?,
     ))
 }
 
+#[cfg(unix)]
 fn systemd_unit(args: &[String], data_dir: &Path, path: &str, role: &str) -> Result<String> {
     let args = args
         .iter()
@@ -87,6 +91,7 @@ fn systemd_unit(args: &[String], data_dir: &Path, path: &str, role: &str) -> Res
     ))
 }
 
+#[cfg(unix)]
 fn service_path(path: &Path) -> Result<&str> {
     let value = path.to_str().context("service paths must be UTF-8")?;
     checked(value)?;
@@ -101,6 +106,7 @@ fn service_path(path: &Path) -> Result<&str> {
     Ok(value)
 }
 
+#[cfg(unix)]
 fn prepare_service_data(directory: &Path, uid: u32) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     if uid == unsafe { libc::geteuid() } {
@@ -131,6 +137,7 @@ fn prepare_service_data(directory: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn prepare_log_directory(directory: &Path, directory_uid: u32, directory_mode: u32) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     service_path(directory)?;
@@ -167,6 +174,7 @@ fn prepare_log_directory(directory: &Path, directory_uid: u32, directory_mode: u
     Ok(())
 }
 
+#[cfg(unix)]
 fn prepare_launchd_logs(
     directory: &Path,
     role: &str,
@@ -228,6 +236,7 @@ fn prepare_launchd_logs(
     Ok(())
 }
 
+#[cfg(unix)]
 fn launch_agent(
     args: &[String],
     data_dir: &Path,
@@ -269,16 +278,18 @@ fn service_arguments(
     if max_jobs == 0 {
         bail!("max-jobs must be at least 1")
     }
-    let executable = env::current_exe()?.canonicalize()?;
-    let token_file = token_file
-        .canonicalize()
-        .context("token file must already exist")?;
+    let executable = crate::platform::command_path(&env::current_exe()?.canonicalize()?);
+    let token_file = crate::platform::command_path(
+        &token_file
+            .canonicalize()
+            .context("token file must already exist")?,
+    );
     if !token_file.is_file() {
         bail!("token-file must be a regular file")
     }
     fs::File::open(&token_file).context("token file must be readable by the service user")?;
     fs::create_dir_all(data_dir)?;
-    let data_dir = data_dir.canonicalize()?;
+    let data_dir = crate::platform::command_path(&data_dir.canonicalize()?);
     let mut args = vec![
         executable.to_string_lossy().into_owned(),
         "--hub".into(),
@@ -306,6 +317,7 @@ fn service_arguments(
 }
 
 /// Install a service for the current user; no root identity or system service is used.
+#[cfg(unix)]
 pub fn install(
     role: &str,
     hub: &str,
@@ -376,6 +388,7 @@ pub fn install(
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn uninstall(role: &str) -> Result<()> {
     role_name(role)?;
     match env::consts::OS {
@@ -639,7 +652,7 @@ pub fn uninstall_system_user(role: &str, service_user: &str) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]
@@ -868,6 +881,260 @@ mod tests {
         assert_eq!(
             fs::read_to_string(directory.join("retained")).unwrap(),
             "keep"
+        );
+    }
+}
+
+// PowerShell single-quoted strings preserve paths and arguments literally.
+#[cfg(any(windows, test))]
+fn powershell_literal(value: &str) -> Result<String> {
+    checked(value)?;
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+#[cfg(windows)]
+fn powershell(script: &str) -> Result<String> {
+    let script = format!(
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); {script}"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("run Windows PowerShell; Task Scheduler and ScheduledTasks must be available")?;
+    if !output.status.success() {
+        bail!(
+            "Task Scheduler operation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(windows)]
+fn windows_task(role: &str) -> Result<(String, PathBuf)> {
+    role_name(role)?;
+    if role != "worker" {
+        bail!("Windows background services currently support the worker role only")
+    }
+    let sid = powershell("[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value")?;
+    if !sid.starts_with("S-1-")
+        || !sid
+            .bytes()
+            .all(|c| c.is_ascii_digit() || c == b'-' || c == b'S')
+    {
+        bail!("cannot resolve the current Windows account SID")
+    }
+    let directory = PathBuf::from(
+        env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is required for Windows user services")?,
+    )
+    .join("ylcc")
+    .join("service");
+    Ok((format!("YLCC-{role}-{sid}"), directory))
+}
+
+#[cfg(any(windows, test))]
+fn windows_runner(args: &[String], directory: &Path, path: &str, log: &Path) -> Result<String> {
+    let (executable, args) = args.split_first().context("missing service executable")?;
+    let args = args
+        .iter()
+        .map(|s| powershell_literal(s))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(format!(
+        "$ErrorActionPreference = 'Stop'\r\n$env:PATH = {}\r\nSet-Location -LiteralPath {}\r\n$ylccArgs = @({args})\r\n$ErrorActionPreference = 'Continue'\r\n& {} @ylccArgs >> {} 2>&1\r\nexit $LASTEXITCODE\r\n",
+        powershell_literal(path)?,
+        powershell_literal(&directory.to_string_lossy())?,
+        powershell_literal(executable)?,
+        powershell_literal(&log.to_string_lossy())?,
+    ))
+}
+
+/// Windows workers run as the installing user while that user is logged in.
+#[cfg(windows)]
+pub fn install(
+    role: &str,
+    hub: &str,
+    token_file: &Path,
+    data_dir: &Path,
+    id: &str,
+    listen: &str,
+    max_jobs: usize,
+) -> Result<()> {
+    use std::{io::Write, os::windows::fs::OpenOptionsExt};
+    let (name, directory) = windows_task(role)?;
+    crate::platform::private_dir(&directory)?;
+    crate::platform::private_dir(data_dir)?;
+    let (args, data_dir) =
+        service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs)?;
+    let script_file = directory.join("worker.ps1");
+    let log = directory.join("worker.log");
+    // Open only a protected regular file before PowerShell redirects into it.
+    let file = match crate::platform::create_private_file(&log) {
+        Ok(file) => file,
+        Err(error) if log.is_file() => {
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&log)
+                .context(error)?;
+            crate::platform::protect_file(&file)?;
+            file
+        }
+        Err(error) => return Err(error),
+    };
+    drop(file);
+    let runner = windows_runner(
+        &args,
+        &data_dir,
+        &env::var("PATH").unwrap_or_default(),
+        &log,
+    )?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    crate::platform::protect_file(temporary.as_file())?;
+    // Windows PowerShell 5.1 needs a BOM to decode non-ASCII paths as UTF-8.
+    temporary.write_all(b"\xef\xbb\xbf")?;
+    temporary.write_all(runner.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    let name = powershell_literal(&name)?;
+    let stop = format!(
+        "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; if ($task) {{ Stop-ScheduledTask -InputObject $task }}"
+    );
+    powershell(&stop)?;
+    crate::platform::replace_file(temporary.path(), &script_file)?;
+    let action_args = format!(
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{}\"",
+        script_file.display()
+    );
+    let install = format!(
+        "$ErrorActionPreference='Stop'; $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \
+         $action=New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument {}; \
+         $trigger=New-ScheduledTaskTrigger -AtLogOn -User $user; \
+         $principal=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited; \
+         $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1); \
+         Register-ScheduledTask -TaskName {name} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null; \
+         Start-ScheduledTask -TaskName {name}",
+        powershell_literal(&action_args)?,
+    );
+    powershell(&install)?;
+    println!(
+        "Installed {name}. The worker starts at this user's logon and runs only while logged in; locking the session is supported. Log: {}",
+        log.display()
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn uninstall(role: &str) -> Result<()> {
+    let (name, directory) = windows_task(role)?;
+    let name = powershell_literal(&name)?;
+    powershell(&format!(
+        "$ErrorActionPreference='Stop'; $task=Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; if ($task) {{ Stop-ScheduledTask -InputObject $task; Unregister-ScheduledTask -InputObject $task -Confirm:$false }}"
+    ))?;
+    let script = directory.join("worker.ps1");
+    if script.exists() {
+        fs::remove_file(script)?;
+    }
+    println!("Removed worker scheduled task; token, binary, logs, and workload data are retained.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::*;
+    #[test]
+    fn runner_preserves_arguments_without_powershell_expansion() {
+        let args = vec![
+            r"C:\Program Files\ylcc.exe".into(),
+            "a' ; $(throw 'injected') & x".into(),
+            "".into(),
+        ];
+        let runner = windows_runner(
+            &args,
+            Path::new("C:/data"),
+            "C:/tools;$notExpanded",
+            Path::new("C:/log"),
+        )
+        .unwrap();
+        assert!(runner.contains("$ylccArgs = @('a'' ; $(throw ''injected'') & x', '')"));
+        assert!(runner.contains("$env:PATH = 'C:/tools;$notExpanded'"));
+        assert!(
+            windows_runner(
+                &["ylcc".into(), "line\nbreak".into()],
+                Path::new("C:/data"),
+                "",
+                Path::new("C:/log")
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    #[cfg(windows)]
+    fn powershell_arguments_roundtrip_on_windows() {
+        let values = [
+            "space argument",
+            "한글 경로/작업",
+            "a' ; $(throw 'injected') & x",
+            "",
+            r"C:\trailing\",
+        ];
+        let array = values
+            .iter()
+            .map(|s| powershell_literal(s).unwrap())
+            .collect::<Vec<_>>()
+            .join(",");
+        let output =
+            powershell(&format!("ConvertTo-Json -Compress -InputObject @({array})")).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed, values);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn runner_executes_under_unicode_paths_and_keeps_stderr_nonfatal() {
+        use std::io::Write;
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("한글 작업 ' 폴더");
+        fs::create_dir(&directory).unwrap();
+        let log = directory.join("worker.log");
+        let script = directory.join("worker.ps1");
+        let runner = windows_runner(
+            &[
+                "powershell.exe".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Write-Output 'NATIVE_OK'; Write-Error 'stderr marker'; exit 0".into(),
+            ],
+            &directory,
+            &env::var("PATH").unwrap(),
+            &log,
+        )
+        .unwrap();
+        let mut file = fs::File::create(&script).unwrap();
+        file.write_all(b"\xef\xbb\xbf").unwrap();
+        file.write_all(runner.as_bytes()).unwrap();
+        drop(file);
+        powershell(&format!(
+            "& {} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}; exit $LASTEXITCODE",
+            powershell_literal("powershell.exe").unwrap(),
+            powershell_literal(&script.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+        let bytes = fs::read(&log).unwrap();
+        // Windows PowerShell 5.1 redirection writes UTF-16LE.
+        let text = String::from_utf16_lossy(
+            &bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            text.contains("NATIVE_OK"),
+            "native command did not run: {text}"
+        );
+        assert!(
+            text.contains("stderr marker"),
+            "native stderr was not captured: {text}"
         );
     }
 }

@@ -59,6 +59,49 @@ jobs:
           name: ylcc-${{ matrix.os }}-${{ matrix.arch }}
           path: ylcc-*.tar.gz
           if-no-files-found: error
+  build-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust stable
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup component add rust-docs
+      - name: Check release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:RELEASE_TAG -ne "v$($metadata.packages[0].version)") { throw 'Release tag does not match the package version.' }
+      - run: cargo fetch --locked
+      - run: python scripts/generate-notices.py --check
+      - run: cargo test --locked --target x86_64-pc-windows-msvc
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - run: python tests/e2e.py target/x86_64-pc-windows-msvc/release/ylcc.exe
+      - name: Windows PowerShell 5.1 installer checks
+        shell: powershell
+        run: ./scripts/test-install.ps1
+      - name: Package the tested Windows binary
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/ylcc.exe dist/ylcc.exe
+          Copy-Item LICENSE dist/LICENSE
+          python scripts/generate-notices.py --output dist/THIRD_PARTY_NOTICES.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./dist/ylcc.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path dist/ylcc.exe,dist/LICENSE,dist/THIRD_PARTY_NOTICES.txt -DestinationPath ylcc-windows-x86_64.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ylcc-windows-x86_64
+          path: ylcc-windows-x86_64.zip
+          if-no-files-found: error
   image:
     needs: build
     permissions:
@@ -99,7 +142,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
   publish:
-    needs: [build, image]
+    needs: [build, build-windows, image]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -127,6 +170,6 @@ jobs:
           docker buildx imagetools create -t "ghcr.io/semanticist21/your-local-cloud-computing:$version" \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-amd64' \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-arm64'
-          (cd dist && sha256sum ylcc-*.tar.gz > SHA256SUMS)
-          gh release create "$RELEASE_TAG" dist/ylcc-*.tar.gz dist/SHA256SUMS \
+          (cd dist && sha256sum ylcc-*.tar.gz ylcc-*.zip > SHA256SUMS)
+          gh release create "$RELEASE_TAG" dist/ylcc-*.tar.gz dist/ylcc-*.zip dist/SHA256SUMS \
             --draft --verify-tag --title "$RELEASE_TAG" --generate-notes
