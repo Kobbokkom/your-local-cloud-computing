@@ -93,12 +93,27 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     }
     Ok(())
 }
-fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create private directory {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("inspect private directory {}", path.display()))?;
+        ensure!(
+            metadata.is_dir(),
+            "private path must be a directory: {}",
+            path.display()
+        );
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "private directory must belong to the worker user: {}",
+            path.display()
+        );
+        if metadata.mode() & 0o7777 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("set private directory permissions {}", path.display()))?;
+        }
     }
     Ok(())
 }
@@ -2163,6 +2178,46 @@ fn rocm_accessible() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn private_directories_preserve_data_and_skip_redundant_chmod() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("worker");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(directory.join("retained"), "keep").unwrap();
+        private_dir(&directory).unwrap();
+        let before = fs::metadata(&directory).unwrap();
+        assert_eq!(before.mode() & 0o7777, 0o700);
+        std::thread::sleep(Duration::from_millis(20));
+        private_dir(&directory).unwrap();
+        let after = fs::metadata(&directory).unwrap();
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("retained")).unwrap(),
+            "keep"
+        );
+        let link = temporary.path().join("link");
+        symlink(&directory, &link).unwrap();
+        private_dir(&link).unwrap();
+        let file_link = temporary.path().join("file-link");
+        symlink(directory.join("retained"), &file_link).unwrap();
+        assert!(private_dir(&file_link).is_err());
+        if unsafe { libc::geteuid() } != 0 {
+            let root = fs::metadata("/").unwrap();
+            let error = private_dir(Path::new("/")).unwrap_err();
+            assert!(error.to_string().contains("must belong to the worker user"));
+            assert_eq!(fs::metadata("/").unwrap().mode(), root.mode());
+            let foreign_link = temporary.path().join("foreign-link");
+            symlink("/", &foreign_link).unwrap();
+            assert!(private_dir(&foreign_link).is_err());
+            assert_eq!(fs::metadata("/").unwrap().mode(), root.mode());
+        }
+    }
     #[test]
     fn docker_and_podman_image_ids_normalize_to_the_same_digest() {
         let hash = "a".repeat(64);
