@@ -50,8 +50,34 @@ if (Test-Path -LiteralPath $destination) {
     Assert-PlainPath $destination $false
     $existing = (New-Object Text.UTF8Encoding($false, $true)).GetString([IO.File]::ReadAllBytes($destination)).Trim()
     if ($existing -cne $token) { throw 'The volume already contains a different token; refusing to replace it.' }
-    $links = @(& fsutil.exe hardlink list $destination 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $links.Count -ne 1) { throw 'The existing token must be a regular file with one hard link.' }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class YlccTokenFileInfo {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Information {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime, LastAccessTime, LastWriteTime;
+        public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle file, out Information information);
+    public static uint LinkCount(SafeFileHandle file) {
+        Information information;
+        if (!GetFileInformationByHandle(file, out information))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        if ((information.Attributes & 0x410) != 0)
+            throw new InvalidOperationException("The token must not be a directory or reparse point.");
+        return information.NumberOfLinks;
+    }
+}
+'@
+    $existingFile = New-Object IO.FileStream($destination, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ([YlccTokenFileInfo]::LinkCount($existingFile.SafeFileHandle) -ne 1) { throw 'The existing token must be a regular file with one hard link.' }
+    } finally { $existingFile.Dispose() }
 }
 foreach ($directory in @($root, (Join-Path $root 'config'), (Join-Path $root 'worker'))) {
     if (-not (Test-Path -LiteralPath $directory)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }

@@ -40,6 +40,16 @@ try {
     }
     Invoke-Docker -Arguments $initialize
     Invoke-Docker -Arguments $initialize # Same-token initialization must preserve an existing volume.
+    $volumeAdmin = @('run', '--rm', '--isolation=process', '--user', 'ContainerAdministrator') + $mounts + @('--entrypoint', 'powershell.exe', $RuntimeImage, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand')
+    $linkCommand = '$ErrorActionPreference="Stop"; New-Item -ItemType HardLink -Path C:\ylcc-data\config\token.link -Target C:\ylcc-data\config\token | Out-Null'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($linkCommand))
+    Invoke-Docker -Arguments ($volumeAdmin + @($encoded))
+    try { Invoke-Docker -Arguments $initialize -ExpectFailure }
+    finally {
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Remove-Item -LiteralPath C:\ylcc-data\config\token.link -ErrorAction Stop'))
+        Invoke-Docker -Arguments ($volumeAdmin + @($encoded))
+    }
+    Invoke-Docker -Arguments $initialize
     Invoke-Docker -Arguments (@('run', '--rm', '--isolation=process') + $mounts + @($Image))
     $proof = @'
 $ErrorActionPreference = 'Stop'

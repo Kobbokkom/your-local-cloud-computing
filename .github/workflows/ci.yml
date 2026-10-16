@@ -29,13 +29,6 @@ jobs:
   windows:
     runs-on: windows-2022
     steps:
-      - name: Windows container daemon preflight
-        run: |
-          docker version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $dockerOS = docker info --format '{{.OSType}}'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($dockerOS -ne 'windows') { throw 'This job requires a Windows container Docker engine.' }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust stable
         run: |
@@ -61,6 +54,30 @@ jobs:
           Compress-Archive -Path dist/ylcc.exe,dist/LICENSE,dist/THIRD_PARTY_NOTICES.txt -DestinationPath ylcc-windows-x86_64.zip
           $hash = (Get-FileHash ylcc-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS'), "$hash  ylcc-windows-x86_64.zip`n")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ylcc-windows-x86_64-preview
+          path: |
+            ylcc-windows-x86_64.zip
+            SHA256SUMS
+          if-no-files-found: error
+  windows-container:
+    needs: windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Windows container daemon preflight
+        run: |
+          docker version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dockerOS = docker info --format '{{.OSType}}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($dockerOS -ne 'windows') { throw 'This job requires a Windows container Docker engine.' }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ylcc-windows-x86_64-preview
+      - name: Prepare the tested Windows binary
+        run: Expand-Archive -LiteralPath ylcc-windows-x86_64.zip -DestinationPath dist
       - name: Build Windows Server Core runtime and CI image
         run: |
           docker build --isolation=process --file Dockerfile.windows --target runtime --tag ylcc-windows:runtime .
@@ -69,10 +86,3 @@ jobs:
       - name: Verify Windows ContainerUser jobs and persistent volume
         shell: powershell
         run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./scripts/test-windows-image.ps1
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ylcc-windows-x86_64-preview
-          path: |
-            ylcc-windows-x86_64.zip
-            SHA256SUMS
-          if-no-files-found: error
