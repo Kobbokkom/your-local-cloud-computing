@@ -297,23 +297,27 @@ mod windows {
             unsafe { (*(self.0.as_ptr().cast::<TOKEN_USER>())).User.Sid }
         }
         fn text(&self) -> Result<String> {
-            let mut sid = null_mut();
-            ensure!(
-                unsafe { ConvertSidToStringSidW(self.sid(), &mut sid) } != 0,
-                "format current user SID: {}",
-                std::io::Error::last_os_error()
-            );
-            let _memory = LocalMemory(sid.cast());
-            let mut len = 0;
-            unsafe {
-                while *sid.add(len) != 0 {
-                    len += 1;
-                }
-            }
-            Ok(String::from_utf16(unsafe {
-                std::slice::from_raw_parts(sid, len)
-            })?)
+            sid_text(self.sid())
         }
+    }
+    fn sid_text(sid: PSID) -> Result<String> {
+        ensure!(!sid.is_null(), "SID is null");
+        let mut text = null_mut();
+        ensure!(
+            unsafe { ConvertSidToStringSidW(sid, &mut text) } != 0,
+            "format SID: {}",
+            std::io::Error::last_os_error()
+        );
+        let _memory = LocalMemory(text.cast());
+        let mut len = 0;
+        unsafe {
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+        }
+        Ok(String::from_utf16(unsafe {
+            std::slice::from_raw_parts(text, len)
+        })?)
     }
     fn wide(path: &Path) -> Result<Vec<u16>> {
         let mut text: Vec<_> = path.as_os_str().encode_wide().collect();
@@ -380,10 +384,29 @@ mod windows {
                     || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
             }
     }
+    fn is_hyperv_container_sid(sid: &str) -> bool {
+        let parts: Vec<_> = sid.split('-').collect();
+        parts.len() == 9
+            && parts[0] == "S"
+            && parts[1] == "1"
+            && parts[2] == "5"
+            && parts[3] == "83"
+            && parts[4] == "1"
+            && parts[5..].iter().all(|part| part.parse::<u32>().is_ok())
+    }
+    fn trusted_owner(sid: PSID, user: &User) -> bool {
+        if trusted(sid, user) {
+            return true;
+        }
+        // Hyper-V assigns this VM SID as the owner of volume objects. Accept it only
+        // in the container image; it is never accepted as a token ACL grantee.
+        std::env::var("YLCC_CONTAINERIZED").is_ok_and(|value| value == "1")
+            && sid_text(sid).is_ok_and(|sid| is_hyperv_container_sid(&sid))
+    }
     fn owned(file: &File) -> Result<()> {
         let (_descriptor, owner, _) = security(file)?;
         ensure!(
-            trusted(owner, &User::current()?),
+            trusted_owner(owner, &User::current()?),
             "private path must belong to the current user, SYSTEM or Administrators"
         );
         Ok(())
@@ -392,7 +415,7 @@ mod windows {
         let (_descriptor, owner, acl) = security(file)?;
         let user = User::current()?;
         ensure!(
-            trusted(owner, &user),
+            trusted_owner(owner, &user),
             "token owner is not the current user, SYSTEM or Administrators"
         );
         ensure!(!acl.is_null(), "token has an unrestricted ACL");
@@ -558,6 +581,27 @@ mod windows {
             std::io::Error::last_os_error()
         );
         Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::is_hyperv_container_sid;
+
+        #[test]
+        fn recognizes_only_canonical_hyperv_container_owner_sids() {
+            assert!(is_hyperv_container_sid(
+                "S-1-5-83-1-4041128834-1186162995-2597271713-775289774"
+            ));
+            for sid in [
+                "S-1-5-83-0",
+                "S-1-5-83-1-1-2-3",
+                "S-1-5-83-1-1-2-3-4-5",
+                "S-1-5-82-1-1-2-3-4",
+                "S-1-5-83-2-1-2-3-4",
+                "S-1-5-83-1-1-2-3-4294967296",
+            ] {
+                assert!(!is_hyperv_container_sid(sid), "accepted {sid}");
+            }
+        }
     }
 }
 
