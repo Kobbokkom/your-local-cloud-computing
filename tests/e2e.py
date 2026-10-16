@@ -153,7 +153,56 @@ def main():
             until(lambda: any(w["online"] for w in cli("workers")[0]))
             reused, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--environment", "test-tools", "--", "sh", "-c", "prepared > answer.txt")
             assert result(reused) == "prepared"
-            print("PASS: native compile, dirty/ignored snapshot, dedup, isolation, queue, cancellation, reconnect, persistent environment")
+
+            # A reviewed project task must resolve inputs at its own file, not the caller's cwd.
+            project_file = project / "ylcc.yaml"
+            project_file.write_text(f'''version: 1
+tasks:
+  copy:
+    command: [sh, -c, "cat input.txt > answer.txt"]
+    inputs: [input.txt]
+    outputs: [answer.txt]
+    requirements: {{os: {os_name}, arch: {arch}}}
+    priority: 10
+    timeout_secs: 30
+''')
+            task = subprocess.run(prefix + ["task", "run", "copy", "--file", str(project_file)],
+                                  cwd=base, text=True, capture_output=True, timeout=90)
+            assert task.returncode == 0, task.stderr
+            assert result(json.loads(task.stdout)) == "99\n"
+
+            paused, _ = cli("workers", "pause", "test-worker")
+            assert paused["paused"]
+            low, _ = cli("run", "--no-input", *common, "--detach", "--", "true")
+            high, _ = cli("run", "--no-input", *common, "--detach", "--", "sleep", "2")
+            reprioritized, _ = cli("jobs", "priority", high["id"], "20")
+            assert reprioritized["spec"]["priority"] == 20
+            assert state(low)["state"] == state(high)["state"] == "queued"
+            cli("workers", "limit", "test-worker", "--max-jobs", "2", ok=False)
+            # Both Hub restart and worker reconnect must retain the operator's pause.
+            stop(worker)
+            stop(hub)
+            hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
+            until(lambda: cli("workers")[0])
+            worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"), "--max-jobs", "2")
+            until(lambda: any(w["online"] and w["paused"] for w in cli("workers")[0]))
+            limited, _ = cli("workers", "limit", "test-worker", "--max-jobs", "1")
+            assert limited["max_jobs"] == 1
+            cli("workers", "resume", "test-worker")
+            until(lambda: state(high)["state"] == "running")
+            assert state(low)["state"] == "queued"
+            cli("jobs", "priority", high["id"], "30", ok=False)
+            wait(high)
+            wait(low)
+            cli("workers", "limit", "test-worker", "--max-jobs", "2")
+            parallel_a, _ = cli("run", "--no-input", *common, "--detach", "--", "sleep", "3")
+            parallel_b, _ = cli("run", "--no-input", *common, "--detach", "--", "sleep", "3")
+            until(lambda: state(parallel_a)["state"] == state(parallel_b)["state"] == "running")
+            cli("workers", "limit", "test-worker", "--max-jobs", "1")
+            assert state(parallel_a)["state"] == state(parallel_b)["state"] == "running"
+            wait(parallel_a)
+            wait(parallel_b)
+            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency")
         except BaseException:
             for stream in streams:
                 stream.flush()

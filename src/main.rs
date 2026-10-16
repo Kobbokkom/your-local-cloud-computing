@@ -6,9 +6,9 @@ use std::{
     fs,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
-use ylcc::{client::Client, model::*, snapshot};
+use ylcc::{client::Client, model::*, project::Project, snapshot};
 
 #[derive(Parser)]
 #[command(
@@ -52,7 +52,15 @@ enum Commands {
     /// Show the input snapshot manifest without submitting a job.
     Manifest(Selection),
     Run(RunArgs),
-    Workers,
+    /// List or run named tasks from a project YAML file.
+    Task {
+        #[command(subcommand)]
+        command: Tasks,
+    },
+    Workers {
+        #[command(subcommand)]
+        command: Option<Workers>,
+    },
     Jobs {
         #[command(subcommand)]
         command: Jobs,
@@ -118,6 +126,8 @@ struct RunArgs {
     container: Option<String>,
     #[arg(long)]
     timeout: Option<u64>,
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-100..=100))]
+    priority: i32,
     #[arg(long)]
     env: Vec<String>,
     #[arg(long)]
@@ -126,6 +136,47 @@ struct RunArgs {
     no_download: bool,
     #[arg(last = true, required = true)]
     command: Vec<String>,
+}
+#[derive(Subcommand)]
+enum Tasks {
+    List {
+        #[arg(long, default_value = "ylcc.yaml")]
+        file: PathBuf,
+    },
+    Run {
+        name: String,
+        #[arg(long, default_value = "ylcc.yaml")]
+        file: PathBuf,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        no_download: bool,
+    },
+}
+#[derive(Subcommand)]
+enum Workers {
+    /// Stop assigning new work; running jobs continue.
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    /// Limit concurrency within the worker's startup max-jobs ceiling.
+    Limit {
+        id: String,
+        #[arg(long, value_parser = parse_max_jobs)]
+        max_jobs: usize,
+    },
+}
+fn parse_max_jobs(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "max-jobs must be a positive integer".to_owned())?;
+    if value == 0 {
+        return Err("max-jobs must be a positive integer".to_owned());
+    }
+    Ok(value)
 }
 #[derive(Subcommand)]
 enum Jobs {
@@ -146,6 +197,12 @@ enum Jobs {
     },
     Cancel {
         id: String,
+    },
+    /// Change the priority of a queued job (-100 through 100).
+    Priority {
+        id: String,
+        #[arg(allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-100..=100))]
+        priority: i32,
     },
 }
 #[derive(Subcommand)]
@@ -227,6 +284,85 @@ fn print<T: Serialize>(v: &T) -> Result<()> {
     Ok(())
 }
 
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).with_context(|| format!("resolve path {}", path.display()))
+}
+
+fn resolve_settings(cli: &Cli, cfg: Config, cfg_path: &Path) -> (String, PathBuf, PathBuf) {
+    let hub = cli
+        .hub
+        .clone()
+        .or(cfg.hub)
+        .unwrap_or_else(|| "http://127.0.0.1:7443".into());
+    let token = cli
+        .token_file
+        .clone()
+        .or(cfg.token_file)
+        .unwrap_or_else(|| cfg_path.parent().unwrap().join("token"));
+    let results = cli
+        .results_dir
+        .clone()
+        .or(cfg.results_dir)
+        .unwrap_or_else(|| data_path().join("results"));
+    (hub, token, results)
+}
+
+async fn submit(
+    client: &Client,
+    snap: snapshot::Snapshot,
+    spec: JobSpec,
+    results: &Path,
+    detach: bool,
+    no_download: bool,
+) -> Result<()> {
+    spec.validate()?;
+    if spec.priority != 0 {
+        let health: serde_json::Value = client.get("/health").await?;
+        let supported = health["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability == "job_priority")
+            });
+        if !supported {
+            bail!(
+                "this Hub does not support job priority; upgrade the Hub before submitting a nonzero priority"
+            )
+        }
+    }
+    let (count, bytes) = client.upload(&snap).await?;
+    eprintln!(
+        "uploaded {count} missing blobs ({bytes} bytes); {} selected files",
+        snap.files.len()
+    );
+    let job: Job = client.post("/v1/jobs", &spec).await?;
+    if detach {
+        print(&job)
+    } else {
+        eprintln!("job {} ({})", job.id, job.state);
+        let j = client.wait(&job.id, results, !no_download).await?;
+        print(&j)?;
+        if j.state != "succeeded" {
+            bail!("job {} ended {}", j.id, j.state)
+        }
+        Ok(())
+    }
+}
+
+async fn diagnostics(hub: &str, token: &Path, local: Capabilities) -> Result<serde_json::Value> {
+    let mut value = serde_json::json!({"local":local});
+    let workers = match Client::new(hub, token) {
+        Ok(client) => client.get::<Vec<WorkerInfo>>("/v1/workers").await,
+        Err(error) => Err(error),
+    };
+    match workers {
+        Ok(workers) => value["workers"] = serde_json::to_value(workers)?,
+        Err(error) => value["hub_error"] = serde_json::Value::String(format!("{error:#}")),
+    }
+    Ok(value)
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = execute().await {
@@ -242,18 +378,7 @@ async fn execute() -> Result<()> {
     } else {
         Config::default()
     };
-    let hub = cli
-        .hub
-        .or(cfg.hub)
-        .unwrap_or_else(|| "http://127.0.0.1:7443".into());
-    let token = cli
-        .token_file
-        .or(cfg.token_file)
-        .unwrap_or_else(|| cfg_path.parent().unwrap().join("token"));
-    let results = cli
-        .results_dir
-        .or(cfg.results_dir)
-        .unwrap_or_else(|| data_path().join("results"));
+    let (hub, token, results) = resolve_settings(&cli, cfg, &cfg_path);
     match cli.command {
         Commands::Init => {
             let parent = token
@@ -279,6 +404,8 @@ async fn execute() -> Result<()> {
         Commands::Configure => {
             ylcc::client::validate_hub(&hub)?;
             ylcc::client::read_token(&token)?;
+            let token = absolute_path(&token)?;
+            let results = absolute_path(&results)?;
             fs::create_dir_all(cfg_path.parent().unwrap())?;
             let mut temp = tempfile::NamedTempFile::new_in(cfg_path.parent().unwrap())?;
             temp.as_file()
@@ -338,31 +465,68 @@ async fn execute() -> Result<()> {
                 container: r.container,
                 env: pairs(r.env)?,
                 timeout_secs: r.timeout,
+                priority: r.priority,
             };
-            spec.validate()?;
-            let (count, bytes) = client.upload(&snap).await?;
-            eprintln!(
-                "uploaded {count} missing blobs ({bytes} bytes); {} selected files",
-                snap.files.len()
-            );
-            let job: Job = client.post("/v1/jobs", &spec).await?;
-            if r.detach {
-                print(&job)
-            } else {
-                eprintln!("job {} ({})", job.id, job.state);
-                let j = client.wait(&job.id, &results, !r.no_download).await?;
-                print(&j)?;
-                if j.state != "succeeded" {
-                    bail!("job {} ended {}", j.id, j.state)
-                }
-                Ok(())
-            }
+            submit(&client, snap, spec, &results, r.detach, r.no_download).await
         }
-        Commands::Workers => print(
-            &Client::new(&hub, &token)?
-                .get::<Vec<WorkerInfo>>("/v1/workers")
-                .await?,
-        ),
+        Commands::Task { command } => match command {
+            Tasks::List { file } => {
+                let (project, _) = Project::load(&file)?;
+                print(&project.tasks)
+            }
+            Tasks::Run {
+                name,
+                file,
+                detach,
+                no_download,
+            } => {
+                let (project, root) = Project::load(&file)?;
+                let task = project.tasks.get(&name).with_context(|| {
+                    format!(
+                        "unknown task {name}; use ylcc task list --file {}",
+                        file.display()
+                    )
+                })?;
+                let snap = task.snapshot(&root)?;
+                let spec = task.spec(snap.files.clone());
+                let client = Client::new(&hub, &token)?;
+                submit(&client, snap, spec, &results, detach, no_download).await
+            }
+        },
+        Commands::Workers { command } => {
+            let client = Client::new(&hub, &token)?;
+            let (id, control) = match command {
+                None => return print(&client.get::<Vec<WorkerInfo>>("/v1/workers").await?),
+                Some(Workers::Pause { id }) => (
+                    id,
+                    WorkerControl {
+                        paused: Some(true),
+                        max_jobs: None,
+                    },
+                ),
+                Some(Workers::Resume { id }) => (
+                    id,
+                    WorkerControl {
+                        paused: Some(false),
+                        max_jobs: None,
+                    },
+                ),
+                Some(Workers::Limit { id, max_jobs }) => (
+                    id,
+                    WorkerControl {
+                        paused: None,
+                        max_jobs: Some(max_jobs),
+                    },
+                ),
+            };
+            ylcc::client::segment(&id)?;
+            print(
+                &client
+                    .post::<_, WorkerInfo>(&format!("/v1/workers/{id}/control"), &control)
+                    .await
+                    .context("control worker; this command requires a Hub with queue controls")?,
+            )
+        }
         Commands::Jobs { command } => {
             let c = Client::new(&hub, &token)?;
             match command {
@@ -393,6 +557,10 @@ async fn execute() -> Result<()> {
                         &c.post::<_, Job>(&format!("/v1/jobs/{id}/cancel"), &serde_json::json!({}))
                             .await?,
                     )
+                }
+                Jobs::Priority { id, priority } => {
+                    ylcc::client::segment(&id)?;
+                    print(&c.post::<_, Job>(&format!("/v1/jobs/{id}/priority"), &PriorityRequest {priority}).await.context("set queued job priority; this command requires a Hub with queue controls")?)
                 }
             }
         }
@@ -427,19 +595,7 @@ async fn execute() -> Result<()> {
                 }
             }
         }
-        Commands::Doctor => {
-            let mut v = serde_json::json!({"local":ylcc::worker::probe().await?});
-            match Client::new(&hub, &token) {
-                Ok(c) => {
-                    v["workers"] =
-                        serde_json::to_value(c.get::<Vec<WorkerInfo>>("/v1/workers").await?)?;
-                }
-                Err(e) => {
-                    v["hub_error"] = serde_json::Value::String(e.to_string());
-                }
-            }
-            print(&v)
-        }
+        Commands::Doctor => print(&diagnostics(&hub, &token, ylcc::worker::probe().await?).await?),
         Commands::Service { command } => match command {
             Services::Install {
                 role,
@@ -466,5 +622,183 @@ async fn execute() -> Result<()> {
                 }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn existing_commands_and_negative_priorities_parse() {
+        let cli = Cli::try_parse_from(["ylcc", "workers"]).unwrap();
+        assert!(matches!(cli.command, Commands::Workers { command: None }));
+        let cli = Cli::try_parse_from([
+            "ylcc",
+            "run",
+            "--no-input",
+            "--priority",
+            "-5",
+            "--",
+            "echo",
+            "ok",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Run(RunArgs { priority: -5, .. })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ylcc",
+                "run",
+                "--no-input",
+                "--priority",
+                "101",
+                "--",
+                "true"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["ylcc", "jobs", "priority", "job-id", "-100"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["ylcc", "workers", "limit", "worker-id", "--max-jobs", "0"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["ylcc", "workers", "limit", "worker-id", "--max-jobs", "2"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_connection_options_override_saved_defaults_for_named_tasks() {
+        let cli = Cli::try_parse_from([
+            "ylcc",
+            "--hub",
+            "https://override.example",
+            "--token-file",
+            "new-token",
+            "--results-dir",
+            "new-results",
+            "task",
+            "run",
+            "build",
+            "--file",
+            "other/ylcc.yaml",
+            "--detach",
+            "--no-download",
+        ])
+        .unwrap();
+        let cfg = Config {
+            hub: Some("https://saved.example".into()),
+            token_file: Some("saved-token".into()),
+            results_dir: Some("saved-results".into()),
+        };
+        let (hub, token, results) =
+            resolve_settings(&cli, cfg, Path::new("/config/ylcc/config.json"));
+        assert_eq!(hub, "https://override.example");
+        assert_eq!(token, Path::new("new-token"));
+        assert_eq!(results, Path::new("new-results"));
+        assert!(
+            matches!(cli.command, Commands::Task {command: Tasks::Run {ref name, ref file, detach: true, no_download: true}} if name == "build" && file == Path::new("other/ylcc.yaml"))
+        );
+        let cli = Cli::try_parse_from(["ylcc", "task", "list"]).unwrap();
+        let cfg = Config {
+            hub: Some("https://saved.example".into()),
+            token_file: Some("saved-token".into()),
+            results_dir: Some("saved-results".into()),
+        };
+        let (hub, token, results) =
+            resolve_settings(&cli, cfg, Path::new("/config/ylcc/config.json"));
+        assert_eq!(hub, "https://saved.example");
+        assert_eq!(token, Path::new("saved-token"));
+        assert_eq!(results, Path::new("saved-results"));
+    }
+
+    #[test]
+    fn configuration_paths_are_independent_of_later_working_directories() {
+        let current = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_path(Path::new("pool.token")).unwrap(),
+            current.join("pool.token")
+        );
+        assert_eq!(
+            absolute_path(Path::new("results")).unwrap(),
+            current.join("results")
+        );
+        assert_eq!(absolute_path(&current).unwrap(), current);
+    }
+
+    fn test_token() -> tempfile::NamedTempFile {
+        let mut token = tempfile::NamedTempFile::new().unwrap();
+        token
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+        writeln!(token, "{}", "a".repeat(64)).unwrap();
+        token
+    }
+
+    #[tokio::test]
+    async fn doctor_preserves_local_information_when_the_hub_request_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/v1/workers",
+            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = test_token();
+        let value = diagnostics(&hub, token.path(), Capabilities::default())
+            .await
+            .unwrap();
+        server.abort();
+        assert!(value["local"].is_object());
+        assert!(value["hub_error"].as_str().unwrap().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn nonzero_priority_requires_a_capable_hub_before_upload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let count = uploads.clone();
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"ok":true})) }),
+            )
+            .route(
+                "/v1/blobs/missing",
+                axum::routing::post(move || async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(MissingBlobs { hashes: vec![] })
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = test_token();
+        let client = Client::new(&hub, token.path()).unwrap();
+        let snap = snapshot::Snapshot {
+            files: vec![],
+            excluded: vec![],
+            blobs: tempfile::tempdir().unwrap(),
+        };
+        let results = tempfile::tempdir().unwrap();
+        let spec = JobSpec {
+            command: vec!["true".into()],
+            priority: 1,
+            ..Default::default()
+        };
+        let error = submit(&client, snap, spec, results.path(), true, false)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("does not support job priority"));
+        assert_eq!(uploads.load(Ordering::SeqCst), 0);
     }
 }
