@@ -1462,6 +1462,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_is_public_but_worker_api_requires_authentication() {
+        use tower::ServiceExt;
+
+        let (_dir, store) = test_store();
+        let app = router(Arc::new(Mutex::new(store)));
+        let home = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(home.status(), StatusCode::OK);
+
+        let workers = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(workers.status(), StatusCode::UNAUTHORIZED);
+
+        let unknown_api = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/not-a-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_api.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn catalogue_rejects_reserved_environment_keys_in_every_case() {
         let (_dir, store) = test_store();
         let state = Arc::new(Mutex::new(store));

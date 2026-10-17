@@ -69,6 +69,11 @@ enum Commands {
         command: Envs,
     },
     Doctor,
+    /// Print the Hub dashboard address and token-file location. Does not print the token value.
+    Dashboard {
+        #[arg(long)]
+        open: bool,
+    },
     Service {
         #[command(subcommand)]
         command: Services,
@@ -604,6 +609,28 @@ async fn execute() -> Result<()> {
             }
         }
         Commands::Doctor => print(&diagnostics(&hub, &token, ylcc::worker::probe().await?).await?),
+        Commands::Dashboard { open } => {
+            let url = format!("{}/", hub.trim_end_matches('/'));
+            print(&serde_json::json!({
+                "dashboard_url": url,
+                "token_file": token,
+                "token guidance": "Run `cat` on token_file in your own shell, then paste it into the dashboard. ylcc does not print or prefill the token.",
+            }))?;
+            if open {
+                #[cfg(target_os = "macos")]
+                let opened = std::process::Command::new("open").arg(&url).status().is_ok();
+                #[cfg(target_os = "windows")]
+                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &url]).status().is_ok();
+                #[cfg(target_os = "linux")]
+                let opened = std::process::Command::new("xdg-open").arg(&url).status().is_ok();
+                #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+                let opened = false;
+                if !opened {
+                    eprintln!("could not open a browser automatically; open dashboard_url manually");
+                }
+            }
+            Ok(())
+        }
         Commands::Service { command } => match command {
             Services::Install {
                 role,

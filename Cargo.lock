@@ -2201,6 +2201,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tower",
  "uuid",
  "windows-sys 0.61.2",
  "yaml_serde",

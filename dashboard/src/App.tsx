@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import {
   Activity,
   Boxes,
@@ -41,6 +41,7 @@ function App() {
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [view, setView] = useState<View>('overview')
   const [refreshing, setRefreshing] = useState(false)
+  const [refreshKey, setRefreshKey] = useState(0)
 
   useEffect(() => {
     if (!token) return
@@ -82,22 +83,23 @@ function App() {
       stopped = true
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [token])
+  }, [token, refreshKey])
 
   const workers = snapshot?.workers ?? []
   const jobs = snapshot?.jobs ?? []
   const onlineWorkers = workers.filter((worker) => worker.online)
   const activeJobs = jobs.filter((job) => activeJobStates.has(job.state))
   const queuedJobs = jobs.filter((job) => job.state === 'queued')
-  const totalCapacity = onlineWorkers.reduce((sum, worker) => sum + worker.max_jobs, 0)
-
-  const jobsByWorker = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const job of activeJobs) {
-      if (job.worker_id) counts.set(job.worker_id, (counts.get(job.worker_id) ?? 0) + 1)
-    }
-    return counts
-  }, [activeJobs])
+  const jobsByWorker = new Map<string, number>()
+  for (const job of activeJobs) {
+    if (job.worker_id) jobsByWorker.set(job.worker_id, (jobsByWorker.get(job.worker_id) ?? 0) + 1)
+  }
+  const schedulableWorkers = onlineWorkers.filter((worker) => !worker.paused)
+  const totalCapacity = schedulableWorkers.reduce((sum, worker) => sum + worker.max_jobs, 0)
+  const availableSlots = schedulableWorkers.reduce(
+    (sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0),
+    0,
+  )
 
   const connect = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -170,7 +172,7 @@ function App() {
               <span className={error ? 'status-dot status-dot-error' : 'status-dot'} />
               {error ? 'Hub unreachable' : 'Live connection'}
             </span>
-            <Button variant="outline" size="sm" onClick={() => window.location.reload()} title="Refresh dashboard">
+            <Button variant="outline" size="sm" onClick={() => setRefreshKey((key) => key + 1)} disabled={refreshing} title="Refresh dashboard">
               <RefreshCw size={14} className={refreshing ? 'spin' : ''} />
               <span>Refresh</span>
             </Button>
@@ -212,6 +214,7 @@ function App() {
                   onlineCount={onlineWorkers.length}
                   activeCount={activeJobs.length}
                   queuedCount={queuedJobs.length}
+                  availableSlots={availableSlots}
                   totalCapacity={totalCapacity}
                   jobsByWorker={jobsByWorker}
                   onNavigate={setView}
@@ -309,6 +312,7 @@ function Overview({
   onlineCount,
   activeCount,
   queuedCount,
+  availableSlots,
   totalCapacity,
   jobsByWorker,
   onNavigate,
@@ -319,6 +323,7 @@ function Overview({
   onlineCount: number
   activeCount: number
   queuedCount: number
+  availableSlots: number
   totalCapacity: number
   jobsByWorker: Map<string, number>
   onNavigate: (view: View) => void
@@ -331,7 +336,7 @@ function Overview({
       <section className="metrics-strip" aria-label="Pool summary">
         <Metric icon={<Server />} label="Online workers" value={`${onlineCount} / ${workers.length}`} note={workers.length ? `${workers.length - onlineCount} offline` : 'No workers registered'} tone="blue" />
         <Metric icon={<Activity />} label="Active jobs" value={String(activeCount)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
-        <Metric icon={<Cpu />} label="Available slots" value={String(Math.max(totalCapacity - activeCount, 0))} note={`${totalCapacity} total across online workers`} tone="green" />
+        <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} on unpaused workers`} tone="green" />
         <Metric icon={<Boxes />} label="Ready environments" value={String(readyStatuses)} note={`${statuses.length} worker installs reported`} tone="slate" />
       </section>
 
