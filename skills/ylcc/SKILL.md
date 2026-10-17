@@ -5,6 +5,13 @@ description: Offload builds, tests, rendering, GPU computation, and other expens
 
 Use the installed `ylcc` CLI to execute work on the configured private pool. Read `ylcc --help` and the relevant subcommand help when an option is uncertain. The CLI writes JSON to stdout and progress to stderr; `--json` makes machine-readable intent explicit. Hub/token defaults come from `ylcc configure` or `YLCC_HUB_URL` / `YLCC_TOKEN_FILE`. Never print token contents or include them in commands, source snapshots, or outputs.
 
+Preflight before submitting:
+- Verify the target worker's actual OS/arch/toolchain/GPU from `ylcc --json workers`; do not infer them from the requester.
+- Inspect the project's `ylcc.yaml` first when it is reviewed; otherwise use explicit `--input`.
+- For build/test commands, use `--no-daemon` for Gradle-like tools and declare every needed `--output`.
+- Check reusable environments with `ylcc --json env status`; prepare explicitly if needed.
+- Prefer remote execution for expensive or platform-specific work; use the requester only for lightweight checks.
+
 1. Run `ylcc --json workers` and inspect each worker's actual capabilities. Choose the execution OS, architecture, toolchain and GPU backend the task requires. Distinguish execution platform from the produced binary's build target. A Docker worker on a Mac executes Linux; CUDA and Metal are different backends. Do not infer that requesting a GPU rewrites a CPU program to use it.
 2. If the project has a reviewed `ylcc.yaml`, inspect it with `ylcc task list` and use `ylcc task run NAME --detach` for a matching task. Commands and inputs are relative to that YAML file. Otherwise select the necessary source files and folders with repeated `--input`. Use `ylcc --json manifest --input PATH` to inspect included files and exclusion reasons. Folder/project selection honors Git ignore rules, including initialized submodule working trees. An explicitly selected ignored file is included; check it contains no unintended secrets. Use `--project` only when the whole project is needed; use `--no-input` when no local files are needed. Inputs are fixed at submission, so submit again after changing source.
 - For dashboard access, run `ylcc dashboard` (and optionally `--open`) to get the Hub URL and configured token-file path. It never prints the token; paste it manually from that path.
