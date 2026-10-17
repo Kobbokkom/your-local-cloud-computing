@@ -989,6 +989,12 @@ async fn dashboard_asset(Path(path): Path<String>) -> Response {
         "x-content-type-options",
         "nosniff".parse().expect("valid security header"),
     );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            .parse()
+            .expect("valid content security policy"),
+    );
     response
 }
 async fn authenticate(

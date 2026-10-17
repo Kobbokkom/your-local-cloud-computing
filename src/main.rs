@@ -279,8 +279,15 @@ fn home() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .expect("HOME or USERPROFILE must be set")
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
+fn valid_release_version(version: &str) -> bool {
+    if !version.starts_with('v') || version.len() > 64 || version.len() < 2 {
+        return false;
+    }
+    version.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
 fn config_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .or_else(|| {
@@ -595,6 +602,22 @@ async fn execute() -> Result<()> {
                 Jobs::Retry { id, detach, no_download } => {
                     ylcc::client::segment(&id)?;
                     let previous = c.job(&id).await?;
+                    if !matches!(previous.state.as_str(), "succeeded" | "failed" | "cancelled") {
+                        bail!("job {} is not terminal ({})", id, previous.state)
+                    }
+                    if previous.spec.priority != 0 {
+                        let health: serde_json::Value = c.get("/health").await?;
+                        let supported = health["capabilities"]
+                            .as_array()
+                            .is_some_and(|capabilities| {
+                                capabilities
+                                    .iter()
+                                    .any(|capability| capability == "job_priority")
+                            });
+                        if !supported {
+                            bail!("this Hub does not support job priority; upgrade the Hub before retrying a nonzero-priority job")
+                        }
+                    }
                     let job: Job = c.post("/v1/jobs", &previous.spec).await?;
                     if detach {
                         print(&job)
@@ -656,6 +679,9 @@ async fn execute() -> Result<()> {
         }
         Commands::Update { version } => {
             let version = version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+            if !valid_release_version(&version) {
+                bail!("invalid release version; expected a tag such as v0.3.8 with only ASCII alphanumerics, dots, or hyphens")
+            }
             let is_windows = cfg!(target_os = "windows");
             let command = if is_windows {
                 format!(
@@ -679,9 +705,25 @@ async fn execute() -> Result<()> {
         }
         Commands::Cleanup { older_than_days, apply } => {
             use std::time::{Duration, SystemTime};
+            let retention_seconds = older_than_days.checked_mul(86400).context("retention period is too large")?;
             let cutoff = SystemTime::now()
-                .checked_sub(Duration::from_secs(older_than_days * 86400))
+                .checked_sub(Duration::from_secs(retention_seconds))
                 .context("invalid retention period")?;
+            let active_job_ids: std::collections::BTreeSet<String> = match Client::new(&hub, &token) {
+                Ok(client) => client
+                    .get::<Vec<Job>>("/v1/jobs")
+                    .await
+                    .ok()
+                    .map(|jobs| {
+                        jobs.into_iter()
+                            .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
+                            .map(|job| job.id)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => std::collections::BTreeSet::new(),
+            };
+            let mut skipped_active = Vec::new();
             let mut candidates = Vec::new();
             if results.exists() {
                 for entry in fs::read_dir(&results)? {
@@ -689,6 +731,12 @@ async fn execute() -> Result<()> {
                     let path = entry.path();
                     if !path.is_dir() {
                         continue;
+                    }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if active_job_ids.contains(name) {
+                            skipped_active.push(name.to_string());
+                            continue;
+                        }
                     }
                     let modified = entry.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                     if modified < cutoff {
@@ -709,6 +757,7 @@ async fn execute() -> Result<()> {
                 "mode": if apply {"applied"} else {"dry-run"},
                 "candidate_count": candidates.len(),
                 "candidates": candidates.iter().map(|(p,_)| p.display().to_string()).collect::<Vec<_>>(),
+                "skipped_active_jobs": skipped_active,
                 "note": if apply {"Removed. Rerun without --apply to preview."} else {"No files were deleted; rerun with --apply to remove."}
             }))?;
             Ok(())
@@ -716,35 +765,18 @@ async fn execute() -> Result<()> {
         Commands::Dashboard { no_open } => {
             let open = !no_open;
             let url = format!("{}/", hub.trim_end_matches('/'));
-            let token_value = fs::read_to_string(&token).ok().map(|s| s.trim().to_string()).unwrap_or_default();
             print(&serde_json::json!({
                 "dashboard_url": url,
-                "token": token_value,
                 "token_file": token,
-                "token_guidance": "The dashboard URL already applies this token through the browser fragment when opened with --open. Keep this output private; never paste it into chat, logs, tickets, or screenshots.",
+                "token_guidance": "Run `cat` on token_file in your own shell, then paste it into the dashboard. ylcc does not print or prefill the token; the token is not placed in browser history or URLs.",
             }))?;
-            let browser_url = if open {
-                match fs::read_to_string(&token) {
-                    Ok(value) => {
-                        let value = value.trim();
-                        if !value.is_empty() {
-                            format!("{}#token={}", url.trim_end_matches('/'), value)
-                        } else {
-                            url.clone()
-                        }
-                    }
-                    _ => url.clone(),
-                }
-            } else {
-                url.clone()
-            };
             if open {
                 #[cfg(target_os = "macos")]
-                let opened = std::process::Command::new("open").arg(&browser_url).status().is_ok();
+                let opened = std::process::Command::new("open").arg(&url).status().is_ok();
                 #[cfg(target_os = "windows")]
-                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &browser_url]).status().is_ok();
+                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &url]).status().is_ok();
                 #[cfg(target_os = "linux")]
-                let opened = std::process::Command::new("xdg-open").arg(&browser_url).status().is_ok();
+                let opened = std::process::Command::new("xdg-open").arg(&url).status().is_ok();
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let opened = false;
                 if !opened {

@@ -31,19 +31,10 @@ import {
 
 type View = 'overview' | 'workers' | 'jobs' | 'environments'
 
-const tokenKey = 'ylcc-dashboard-token'
 const activeJobStates = new Set(['assigned', 'running'])
 
 function App() {
-  const [token, setToken] = useState(() => {
-    const hashToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
-    if (hashToken) {
-      sessionStorage.setItem(tokenKey, hashToken)
-      window.history.replaceState(null, '', window.location.pathname + window.location.search)
-      return hashToken
-    }
-    return sessionStorage.getItem(tokenKey) ?? ''
-  })
+  const [token, setToken] = useState('')
   const [tokenInput, setTokenInput] = useState('')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [error, setError] = useState('')
@@ -70,7 +61,6 @@ function App() {
         if (!stopped) {
           const message = cause instanceof Error ? cause.message : 'Could not reach the Hub.'
           if (message === 'AUTH_REQUIRED') {
-            sessionStorage.removeItem(tokenKey)
             setToken('')
             setTokenInput('')
             setSnapshot(null)
@@ -114,14 +104,12 @@ function App() {
     event.preventDefault()
     const next = tokenInput.trim()
     if (!next) return
-    sessionStorage.setItem(tokenKey, next)
     setToken(next)
     setTokenInput('')
     setSnapshot(null)
   }
 
   const disconnect = () => {
-    sessionStorage.removeItem(tokenKey)
     setToken('')
     setSnapshot(null)
     setError('')
