@@ -53,3 +53,7 @@ Use these when a user gives a natural-language request:
 - dashboard: "Open the dashboard but don't expose the token." -> `dashboard --open`, read token from the token file later.
 
 These prompts are safe targets for skill regression checks. Never substitute the requester's OS/arch for a worker's actual capability.
+
+## Installation reference
+
+If `ylcc` is missing or the skill is installed from a newer/older release, read [installation.md](installation.md) before attempting to configure a project. Never ask for token contents.
