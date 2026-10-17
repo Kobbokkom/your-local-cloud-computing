@@ -45,7 +45,7 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
         run: |
           cargo fetch --locked
-          python3 scripts/generate-notices.py --check
+          python3 scripts/generate-notices.py --output THIRD_PARTY_NOTICES.txt
           cargo test --locked --target '${{ matrix.target }}'
           cargo build --locked --release --target '${{ matrix.target }}'
           python3 tests/e2e.py 'target/${{ matrix.target }}/release/ylcc'
@@ -84,7 +84,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($env:RELEASE_TAG -ne "v$($metadata.packages[0].version)") { throw 'Release tag does not match the package version.' }
       - run: cargo fetch --locked
-      - run: python scripts/generate-notices.py --check
+      - run: python scripts/generate-notices.py --output THIRD_PARTY_NOTICES.txt
       - run: cargo test --locked --target x86_64-pc-windows-msvc
       - run: cargo build --locked --release --target x86_64-pc-windows-msvc
       - run: python tests/e2e.py target/x86_64-pc-windows-msvc/release/ylcc.exe
