@@ -371,12 +371,28 @@ function WorkersView({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsByW
 }
 
 function JobsView({ jobs }: { jobs: Job[] }) {
-  const ordered = [...jobs].sort((a, b) => b.created_at - a.created_at)
+  const [filter, setFilter] = useState('')
+  const ordered = [...jobs]
+    .filter((job) => {
+      const haystack = [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', ...job.spec.command].join(' ').toLowerCase()
+      return haystack.includes(filter.toLowerCase())
+    })
+    .sort((a, b) => b.created_at - a.created_at)
   return (
     <section className="content-section view-section">
-      <SectionHeading title="Job history" detail={`${jobs.length} jobs`} />
+      <SectionHeading title="Job history" detail={`${ordered.length} of ${jobs.length} jobs`} />
+      <div className="filter-row">
+        <input
+          className="token-input"
+          type="search"
+          aria-label="Filter jobs"
+          placeholder="Filter by job, state, worker, command"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+        />
+      </div>
       {ordered.length ? <JobsTable jobs={ordered} /> : (
-        <EmptyState icon={<Terminal />} title="No jobs submitted" detail="Submitted jobs and their latest states will appear here." />
+        <EmptyState icon={<Terminal />} title="No matching jobs" detail="Submitted jobs and their latest states will appear here." />
       )}
     </section>
   )
