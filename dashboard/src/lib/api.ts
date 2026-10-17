@@ -82,6 +82,19 @@ export function formatTime(timestamp: number): string {
   }).format(new Date(milliseconds))
 }
 
+export async function fetchJobLogs(token: string, jobId: string): Promise<unknown[]> {
+  const response = await fetch(`/v1/jobs/${encodeURIComponent(jobId)}/logs`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: 'no-store',
+  })
+  if (!response.ok) {
+    if (response.status === 401) throw new Error('AUTH_REQUIRED')
+    const message = await response.text()
+    throw new Error(message || `Hub returned ${response.status}`)
+  }
+  return response.json() as Promise<unknown[]>
+}
+
 export function formatMemory(bytes: number): string {
   if (!bytes) return '—'
   const gibibytes = bytes / 1024 ** 3

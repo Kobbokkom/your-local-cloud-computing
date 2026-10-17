@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import { Badge, Button } from './components/ui'
 import {
+  fetchJobLogs,
   fetchSnapshot,
   formatMemory,
   formatTime,
@@ -221,7 +222,7 @@ function App() {
                 />
               )}
               {view === 'workers' && <WorkersView workers={workers} jobsByWorker={jobsByWorker} />}
-              {view === 'jobs' && <JobsView jobs={jobs} />}
+              {view === 'jobs' && <JobsView jobs={jobs} token={token} />}
               {view === 'environments' && (
                 <EnvironmentsView environments={snapshot.environments} statuses={snapshot.environmentStatuses} />
               )}
@@ -370,14 +371,32 @@ function WorkersView({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsByW
   )
 }
 
-function JobsView({ jobs }: { jobs: Job[] }) {
+function JobsView({ jobs, token }: { jobs: Job[]; token: string }) {
   const [filter, setFilter] = useState('')
+  const [selectedId, setSelectedId] = useState(jobs[0]?.id ?? '')
+  const [logs, setLogs] = useState<unknown[]>([])
+  const [logError, setLogError] = useState('')
   const ordered = [...jobs]
     .filter((job) => {
       const haystack = [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', ...job.spec.command].join(' ').toLowerCase()
       return haystack.includes(filter.toLowerCase())
     })
     .sort((a, b) => b.created_at - a.created_at)
+  useEffect(() => {
+    if (!selectedId) return
+    let stopped = false
+    setLogError('')
+    void fetchJobLogs(token, selectedId).then((next) => {
+      if (!stopped) setLogs(next)
+    }).catch((cause) => {
+      if (!stopped) {
+        const message = cause instanceof Error ? cause.message : 'Could not load logs.'
+        if (message === 'AUTH_REQUIRED') setLogError('Token rejected.')
+        else setLogError(message)
+      }
+    })
+    return () => { stopped = true }
+  }, [selectedId, token])
   return (
     <section className="content-section view-section">
       <SectionHeading title="Job history" detail={`${ordered.length} of ${jobs.length} jobs`} />
@@ -393,6 +412,17 @@ function JobsView({ jobs }: { jobs: Job[] }) {
       </div>
       {ordered.length ? <JobsTable jobs={ordered} /> : (
         <EmptyState icon={<Terminal />} title="No matching jobs" detail="Submitted jobs and their latest states will appear here." />
+      )}
+      {jobs.length > 0 && (
+        <div className="log-panel">
+          <SectionHeading title="Job logs" detail={selectedId ? `Selected ${selectedId.slice(0, 8)}` : 'No job selected'} />
+          <select className="token-input" value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>
+            {jobs.map((job) => <option key={job.id} value={job.id}>{job.id.slice(0, 8)} · {job.state}</option>)}
+          </select>
+          {logError ? <p className="form-error" role="alert">{logError}</p> : (
+            <pre className="command-cell">{logs.length ? JSON.stringify(logs, null, 2) : 'No logs returned.'}</pre>
+          )}
+        </div>
       )}
     </section>
   )
