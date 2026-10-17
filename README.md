@@ -41,8 +41,8 @@ Download a versioned binary for Linux/macOS on x86_64/arm64. The installer verif
 
 ```bash
 task_tmp="$(mktemp -d)"
-curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.2.0/scripts/install.sh -o "$task_tmp/install.sh"
-bash "$task_tmp/install.sh" --version v0.2.0
+curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.4.4/scripts/install.sh -o "$task_tmp/install.sh"
+bash "$task_tmp/install.sh" --version v0.4.4
 rm "$task_tmp/install.sh"
 rmdir "$task_tmp"
 export PATH="$HOME/.local/bin:$PATH"
@@ -56,9 +56,9 @@ Use `--prefix /your/prefix` to change the install location. You can also downloa
 The binary installer installs the executable and license notices. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer below, fetch the matching versioned support checkout outside your application project:
 
 ```bash
-export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.2.0"
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.4.4"
 mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
-git clone --depth 1 --branch v0.2.0 \
+git clone --depth 1 --branch v0.4.4 \
   https://github.com/semanticist21/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
 ```
 
