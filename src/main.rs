@@ -765,18 +765,33 @@ async fn execute() -> Result<()> {
         Commands::Dashboard { no_open } => {
             let open = !no_open;
             let url = format!("{}/", hub.trim_end_matches('/'));
+            let browser_url = if open {
+                match fs::read_to_string(&token) {
+                    Ok(value) => {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            format!("{}#token={}", url.trim_end_matches('/'), value)
+                        } else {
+                            url.clone()
+                        }
+                    }
+                    _ => url.clone(),
+                }
+            } else {
+                url.clone()
+            };
             print(&serde_json::json!({
                 "dashboard_url": url,
                 "token_file": token,
-                "token_guidance": "Run `cat` on token_file in your own shell, then paste it into the dashboard. ylcc does not print or prefill the token; the token is not placed in browser history or URLs.",
+                "token_guidance": "The browser is opened with the token in the URL fragment when possible. On shared/public machines, use --no-open and paste the token manually to avoid browser history.",
             }))?;
             if open {
                 #[cfg(target_os = "macos")]
-                let opened = std::process::Command::new("open").arg(&url).status().is_ok();
+                let opened = std::process::Command::new("open").arg(&browser_url).status().is_ok();
                 #[cfg(target_os = "windows")]
-                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &url]).status().is_ok();
+                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &browser_url]).status().is_ok();
                 #[cfg(target_os = "linux")]
-                let opened = std::process::Command::new("xdg-open").arg(&url).status().is_ok();
+                let opened = std::process::Command::new("xdg-open").arg(&browser_url).status().is_ok();
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let opened = false;
                 if !opened {

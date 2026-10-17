@@ -34,7 +34,11 @@ type View = 'overview' | 'workers' | 'jobs' | 'environments'
 const activeJobStates = new Set(['assigned', 'running'])
 
 function App() {
-  const [token, setToken] = useState('')
+  const [token, setToken] = useState(() => {
+    const hashToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
+    if (hashToken) window.history.replaceState(null, '', window.location.pathname + window.location.search)
+    return hashToken ?? ''
+  })
   const [tokenInput, setTokenInput] = useState('')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [error, setError] = useState('')

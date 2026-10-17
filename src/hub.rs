@@ -1449,6 +1449,7 @@ mod tests {
         store.schedule().unwrap();
     }
 
+    #[cfg(dashboard_assets)]
     #[tokio::test]
     async fn dashboard_serves_embedded_assets_but_not_unknown_api_paths() {
         let index = dashboard_index().await;
@@ -1473,6 +1474,7 @@ mod tests {
         assert_eq!(unknown_api.status(), StatusCode::NOT_FOUND);
     }
 
+    #[cfg(dashboard_assets)]
     #[tokio::test]
     async fn dashboard_is_public_but_worker_api_requires_authentication() {
         use tower::ServiceExt;
