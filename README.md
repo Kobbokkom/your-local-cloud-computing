@@ -123,11 +123,16 @@ Configure the actual private HTTPS Hub URL, a unique worker ID and concurrency, 
 $env:YLCC_HUB_URL = 'https://HUB.example.ts.net:10000'
 $env:YLCC_WORKER_ID = 'windows-container'
 $env:YLCC_MAX_JOBS = '1'
+# For a tailnet-only Hub, use MagicDNS plus your usual public DNS resolver.
+$env:YLCC_WINDOWS_DNS_PRIMARY = '100.100.100.100'
+$env:YLCC_WINDOWS_DNS_FALLBACK = 'YOUR_STANDARD_DNS_SERVER'
 docker compose -f compose.windows.yaml up -d
 docker compose -f compose.windows.yaml logs --tail 40
 # Removing the container retains the external named volume:
 docker compose -f compose.windows.yaml down
 ```
+
+The two DNS overrides are optional. Leave them unset when the container's default DNS can resolve the Hub. `100.100.100.100` is Tailscale's device-local [Quad100 DNS resolver](https://tailscale.com/docs/reference/quad100); keep a regular resolver as fallback so public hostnames used by jobs still resolve.
 
 Docker's restart policy manages the worker while the Windows container engine is running. Set up engine startup through your existing Windows runtime. Request `--os windows --arch x86_64` for these jobs; this worker advertises Windows and `containerized: true`. The plain image has no host runtime pipe or nested container engine, and Windows GPU capabilities are not advertised without a working native probe.
 
