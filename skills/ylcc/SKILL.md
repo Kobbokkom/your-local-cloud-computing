@@ -40,3 +40,16 @@ Agent-native behavior:
 6. Before upgrading an existing pool, use `ylcc update --version VERSION` (or without `--version` for the current package version) to get the platform-specific verified install command. It keeps the saved Hub URL/token-file/results directory references, worker data, hub data, and service IDs unless you explicitly reinstall. Drain jobs and stop the hub/worker service before replacing a running binary, then verify with `ylcc --version`.
 
 6. Report the worker/platform, exit status, verification performed, and result path. If a worker disconnects or an attempt becomes `unknown`, inspect the original attempt before resubmitting; a missing connection does not prove the command stopped. Use `ylcc jobs cancel JOB_ID` to cancel. `workers pause ID` stops new work while active jobs finish; `workers resume ID` resumes scheduling. `workers limit ID --max-jobs N` adjusts concurrency within the startup capacity, and `jobs priority ID N` changes queued-job priority (-100 to 100). Do not alter another operator's controls without authorization, silently duplicate work, or run a heavy fallback on the requester. CPU/memory hard caps belong to the runtime/OS; concurrency is not a CPU percentage limit.
+
+## Prompt examples
+
+Use these when a user gives a natural-language request:
+- health: "Check the pool and workers, but don't run anything." -> `ylcc --json status`, then `ylcc --json workers`.
+- platform: "Run this only on a powered Windows x86_64 worker." -> filter `workers` by `online`, `os`, `arch`, then submit.
+- build: "Build this on Linux x86_64 and bring back the binary." -> inspect project inputs with `manifest`, then `run --input ... --output ... --detach`, then `jobs wait ID`.
+- repeat: "Use the reviewed project task." -> `task list`, then `task run NAME --detach`.
+- environment: "Use the prepared Rust toolchain." -> `env status`, prepare it explicitly if required.
+- queue control: "Make this urgent." -> a queued job only: `jobs priority ID N`.
+- dashboard: "Open the dashboard but don't expose the token." -> `dashboard --open`, read token from the token file later.
+
+These prompts are safe targets for skill regression checks. Never substitute the requester's OS/arch for a worker's actual capability.

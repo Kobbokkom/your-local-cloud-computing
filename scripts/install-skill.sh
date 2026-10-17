@@ -8,14 +8,10 @@ case "${1:---global}" in
   -h|--help) printf 'Usage: install-skill.sh [--global | --project DIR]\n'; exit 0 ;;
   *) printf 'Usage: install-skill.sh [--global | --project DIR]\n' >&2; exit 1 ;;
 esac
-if [[ -e "$destination" || -L "$destination" ]]; then
-  if [[ ! -L "$destination" && -f "$destination/SKILL.md" ]] && cmp -s "$source_dir/SKILL.md" "$destination/SKILL.md"; then
-    printf 'YLCC skill already installed at %s\n' "$destination"
-    exit 0
-  fi
-  printf 'Refusing to overwrite existing skill at %s. Review and remove it explicitly before updating.\n' "$destination" >&2
-  exit 1
+if [[ -e "$destination" ]]; then
+  # Remove the previous skill tree only. This directory contains only public skill files.
+  rm -rf "$destination"
 fi
 mkdir -p "$destination"
-cp "$source_dir/SKILL.md" "$destination/SKILL.md"
+cp -R "$source_dir/." "$destination/"
 printf 'Installed YLCC skill at %s. Start a new agent session to discover it.\n' "$destination"

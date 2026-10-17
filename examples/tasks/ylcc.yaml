@@ -1,0 +1,11 @@
+version: 1
+tasks:
+  smoke:
+    command: ["sh", "-c", "printf '{\"platform\":\"%s\",\"ok\":true}\\n' \"$(uname -sm)\""]
+    no_input: true
+    outputs: []
+    requirements:
+      os: linux
+      arch: aarch64
+    timeout_secs: 60
+    priority: 0

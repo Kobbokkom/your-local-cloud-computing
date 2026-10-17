@@ -476,6 +476,14 @@ Start a new agent session. For Codex, skills are discovered from `~/.agents/skil
 
 Ask naturally: “Build this on a Linux x86_64 worker and bring back the binary,” or explicitly invoke `$ylcc`. The skill discovers workers, chooses requirements and selected inputs, submits asynchronously, checks logs/status and downloads declared results. It does not add an MCP server or run another agent on the worker.
 
+Try these natural prompts after installing the skill:
+- "Check the pool and workers, but don't run anything."
+- "Run this only on a powered Windows x86_64 worker."
+- "Build this on Linux x86_64 and bring back the binary."
+- "Use the reviewed `ylcc.yaml` build task, then await and fetch its result."
+- "Open the dashboard without giving me the token in chat."
+
+
 ## GPU and platform checks
 
 Programs must actually use the requested GPU backend. `--gpu cuda`, `--gpu rocm` and `--gpu metal` select distinct capabilities; they do not translate CPU code or pool GPU memory over the network. Check `workers` and run an actual workload to validate device/driver access under the service account. Container GPU execution additionally needs the host's NVIDIA/CDI or ROCm runtime configuration.
