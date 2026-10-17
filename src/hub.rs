@@ -219,6 +219,12 @@ impl Store {
         self.db.execute("INSERT INTO workers(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![worker.id, encode(worker)?])?;
         Ok(())
     }
+    fn delete_worker(&mut self, id: &str) -> Result<()> {
+        self.db.execute("DELETE FROM worker_settings WHERE id=?1", [id])?;
+        self.db.execute("DELETE FROM workers WHERE id=?1", [id])?;
+        Ok(())
+    }
+
     fn worker_settings(&self, worker: &WorkerInfo) -> Result<WorkerSettings> {
         Ok(self
             .one("SELECT data FROM worker_settings WHERE id=?1", &worker.id)?
@@ -922,6 +928,7 @@ pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Resu
 fn router(state: Shared) -> Router {
     let protected = Router::new()
         .route("/v1/workers", get(workers))
+        .route("/v1/workers/{id}", axum::routing::delete(delete_worker))
         .route("/v1/workers/{id}/control", post(control_worker))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
@@ -1042,6 +1049,20 @@ async fn authenticate(
 async fn workers(State(state): State<Shared>) -> ApiResult<Json<Vec<WorkerInfo>>> {
     Ok(Json(lock(&state)?.workers()?))
 }
+async fn delete_worker(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let mut guard = lock(&state)?;
+    if guard.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?.is_none() {
+        return Err(missing("worker").into());
+    }
+    if guard.jobs().unwrap_or_default().into_iter().any(|job| {
+        (job.state == "assigned" || job.state == "running") && job.worker_id.as_deref() == Some(&id)
+    }) {
+        return Err(invalid("worker has active jobs; drain it first"));
+    }
+    guard.delete_worker(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn control_worker(
     State(state): State<Shared>,
     Path(id): Path<String>,

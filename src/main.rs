@@ -41,8 +41,9 @@ enum Commands {
         data_dir: Option<PathBuf>,
     },
     Worker {
+        /// Worker id. Defaults to HOSTNAME (or COMPUTERNAME on Windows) when omitted.
         #[arg(long)]
-        id: String,
+        id: Option<String>,
         #[arg(long)]
         data_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 1)]
@@ -185,6 +186,10 @@ enum Workers {
         #[arg(long, value_parser = parse_max_jobs)]
         max_jobs: usize,
     },
+    /// Delete a worker from the Hub's worker list.
+    Delete {
+        id: String,
+    },
 }
 fn parse_max_jobs(value: &str) -> std::result::Result<usize, String> {
     let value = value
@@ -274,6 +279,15 @@ struct Config {
     hub: Option<String>,
     token_file: Option<PathBuf>,
     results_dir: Option<PathBuf>,
+}
+
+fn default_worker_id() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| std::env::var("HOST"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "ylcc-worker".to_string())
 }
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -472,6 +486,7 @@ async fn execute() -> Result<()> {
             data_dir,
             max_jobs,
         } => {
+            let id = id.unwrap_or_else(default_worker_id);
             ylcc::worker::run(
                 hub,
                 token,
@@ -559,6 +574,10 @@ async fn execute() -> Result<()> {
                         max_jobs: Some(max_jobs),
                     },
                 ),
+                Some(Workers::Delete { id }) => {
+                    client.delete(&format!("/v1/workers/{}", id)).await?;
+                    return print(&serde_json::json!({"deleted": id}));
+                }
             };
             ylcc::client::segment(&id)?;
             print(

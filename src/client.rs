@@ -107,6 +107,20 @@ impl Client {
         }
         Ok((missing.hashes.len(), bytes))
     }
+
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        let response = self
+            .http
+            .delete(format!("{}{}", self.hub, path))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("HTTP {}: {}", status, path)
+        }
+        Ok(())
+    }
     pub async fn job(&self, id: &str) -> Result<Job> {
         segment(id)?;
         self.get(&format!("/v1/jobs/{id}")).await
