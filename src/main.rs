@@ -78,8 +78,31 @@ enum Commands {
     Status,
     /// Print the verified install/upgrade command for this platform without exposing tokens.
     Update {
-        #[arg(long)]
+        /// Release tag to install, for example v0.4.2.
+        #[arg(long, conflicts_with = "latest")]
         version: Option<String>,
+        /// Resolve the newest published release tag before installing or printing the command.
+        #[arg(long)]
+        latest: bool,
+        /// Download and execute the verified installer instead of only printing it.
+        #[arg(long)]
+        apply: bool,
+        /// Replace the current binary without checking active Hub jobs first.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Resolve the newest (or requested) release and install it in one step.
+    #[command(alias = "up")]
+    Upgrade {
+        /// Release tag to install, for example v0.4.2.
+        #[arg(long, conflicts_with = "latest")]
+        version: Option<String>,
+        /// Resolve the newest published release tag before installing (default when --version is omitted).
+        #[arg(long)]
+        latest: bool,
+        /// Replace the current binary without checking active Hub jobs first.
+        #[arg(long)]
+        force: bool,
     },
     /// Preview or remove downloaded job result directories older than the given number of days.
     Cleanup {
@@ -333,6 +356,103 @@ fn valid_release_version(version: &str) -> bool {
         return false;
     }
     version.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+async fn resolve_latest_release_version() -> Result<String> {
+    let api_url = std::env::var("YLCC_UPDATE_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com/repos/semanticist21/your-local-cloud-computing/releases/latest".to_string());
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("ylcc/{}", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await
+        .context("failed to query GitHub releases")?;
+    if !response.status().is_success() {
+        bail!("GitHub releases request failed with {}", response.status())
+    }
+    let body: serde_json::Value = response.json().await.context("invalid GitHub release response")?;
+    let tag = body["tag_name"]
+        .as_str()
+        .context("GitHub did not return tag_name")?
+        .to_string();
+    Ok(tag)
+}
+
+async fn update_release(
+    version: Option<String>,
+    latest: bool,
+    apply: bool,
+    force: bool,
+    hub: &str,
+    token: &Path,
+) -> Result<()> {
+            let version = if latest {
+                resolve_latest_release_version().await?
+            } else {
+                version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
+            };
+            if !valid_release_version(&version) {
+                bail!("invalid release version; expected a tag such as v0.3.8 with only ASCII alphanumerics, dots, or hyphens")
+            }
+            if apply && !force {
+                if let Ok(client) = Client::new(&hub, &token) {
+                    let active: Vec<String> = match client.get::<Vec<Job>>("/v1/jobs").await {
+                        Ok(jobs) => jobs
+                            .into_iter()
+                            .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
+                            .map(|job| job.id)
+                            .collect(),
+                        Err(error) => {
+                            bail!("cannot verify active jobs before replacing the binary: {error:#}; drain jobs or pass --force")
+                        }
+                    };
+                    if !active.is_empty() {
+                        bail!("active jobs remain ({}); pause/finish them or pass --force", active.join(", "))
+                    }
+                } else {
+                    bail!("cannot verify active jobs before replacing the binary; configure the Hub and token or pass --force")
+                }
+            }
+            let is_windows = cfg!(target_os = "windows");
+            let command = if is_windows {
+                format!(
+                    "$env:YLCC_VERSION='{}'; irm https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.ps1 | iex",
+                    version, version
+                )
+            } else {
+                format!(
+                    "YLCC_VERSION={} curl -fsSL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.sh | sh -s -- --version {}",
+                    version, version, version
+                )
+            };
+            if apply {
+                eprintln!("running verified installer for {version}");
+                let status = if is_windows {
+                    std::process::Command::new("powershell")
+                        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
+                        .status()
+                        .context("failed to launch the Windows installer")?
+                } else {
+                    std::process::Command::new("sh")
+                        .args(["-c", &command])
+                        .status()
+                        .context("failed to launch the POSIX installer")?
+                };
+                if !status.success() {
+                    bail!("installer exited with status {status}")
+                }
+            }
+            print(&serde_json::json!({
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "target_version": version.trim_start_matches('v'),
+                "preserved": ["config.json", "token file", "results_dir", "worker data", "hub data", "background service IDs unless you reinstall"],
+                "command": command,
+                "mode": if apply {"applied"} else {"planned"},
+                "note": "Drain active jobs and stop hub/worker services before replacing a running binary; verify with `ylcc --version` afterward."
+            }))?;
+            Ok(())
 }
 
 fn config_path() -> PathBuf {
@@ -866,31 +986,12 @@ async fn execute() -> Result<()> {
             }
             print(&diag)
         }
-        Commands::Update { version } => {
-            let version = version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
-            if !valid_release_version(&version) {
-                bail!("invalid release version; expected a tag such as v0.3.8 with only ASCII alphanumerics, dots, or hyphens")
-            }
-            let is_windows = cfg!(target_os = "windows");
-            let command = if is_windows {
-                format!(
-                    "$env:YLCC_VERSION='{}'; irm https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.ps1 | iex",
-                    version, version
-                )
-            } else {
-                format!(
-                    "YLCC_VERSION={} curl -fsSL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.sh | sh -s -- --version {}",
-                    version, version, version
-                )
-            };
-            print(&serde_json::json!({
-                "current_version": env!("CARGO_PKG_VERSION"),
-                "target_version": version.trim_start_matches('v'),
-                "preserved": ["config.json", "token file", "results_dir", "worker data", "hub data", "background service IDs unless you reinstall"],
-                "command": command,
-                "note": "Drain active jobs and stop hub/worker services before replacing a running binary; verify with `ylcc --version` afterward."
-            }))?;
-            Ok(())
+        Commands::Update { version, latest, apply, force } => {
+            update_release(version, latest, apply, force, &hub, &token).await
+        }
+        Commands::Upgrade { version, latest, force } => {
+            let latest = latest || version.is_none();
+            update_release(version, latest, true, force, &hub, &token).await
         }
         Commands::Cleanup { older_than_days, apply } => {
             use std::time::{Duration, SystemTime};

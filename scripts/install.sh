@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${YLCC_VERSION:-v0.2.0}"
+version="${YLCC_VERSION:-v0.4.3}"
 prefix="${YLCC_PREFIX:-${HOME:?HOME is required}/.local}"
 while (($#)); do
   case "$1" in
