@@ -90,8 +90,11 @@ enum Commands {
     },
     /// Print the Hub dashboard address and token-file location. Does not print the token value.
     Dashboard {
-        /// Do not launch a browser; print the URL and token-file path only.
+        /// Launch or avoid browser launch. Defaults to opening a browser on supported platforms.
         #[arg(long)]
+        open: bool,
+        /// Do not launch a browser; print the URL and token-file path only.
+        #[arg(long, conflicts_with = "open")]
         no_open: bool,
     },
     Service {
@@ -658,6 +661,7 @@ async fn execute() -> Result<()> {
                     },
                 ),
                 Some(Workers::Delete { id }) => {
+                    ylcc::client::segment(&id)?;
                     client.delete(&format!("/v1/workers/{}", id)).await?;
                     return print(&serde_json::json!({"deleted": id}));
                 }
@@ -894,19 +898,16 @@ async fn execute() -> Result<()> {
             let cutoff = SystemTime::now()
                 .checked_sub(Duration::from_secs(retention_seconds))
                 .context("invalid retention period")?;
-            let active_job_ids: std::collections::BTreeSet<String> = match Client::new(&hub, &token) {
-                Ok(client) => client
+            let active_job_ids: std::collections::BTreeSet<String> = {
+                let client = Client::new(&hub, &token).context("failed to connect to the Hub, active jobs cannot be enumerated")?;
+                client
                     .get::<Vec<Job>>("/v1/jobs")
                     .await
-                    .ok()
-                    .map(|jobs| {
-                        jobs.into_iter()
-                            .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
-                            .map(|job| job.id)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                Err(_) => std::collections::BTreeSet::new(),
+                    .context("failed to query active Hub jobs, cleanup aborted")?
+                    .into_iter()
+                    .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
+                    .map(|job| job.id)
+                    .collect()
             };
             let mut skipped_active = Vec::new();
             let mut candidates = Vec::new();
@@ -947,8 +948,8 @@ async fn execute() -> Result<()> {
             }))?;
             Ok(())
         }
-        Commands::Dashboard { no_open } => {
-            let open = !no_open;
+        Commands::Dashboard { open, no_open } => {
+            let open = open || !no_open;
             let url = format!("{}/", hub.trim_end_matches('/'));
             let browser_url = if open {
                 match fs::read_to_string(&token) {
