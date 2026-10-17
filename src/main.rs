@@ -167,6 +167,16 @@ enum Tasks {
         #[arg(long, default_value = "ylcc.yaml")]
         file: PathBuf,
     },
+    Init {
+        #[arg(long, default_value = "ylcc.yaml")]
+        file: PathBuf,
+        #[arg(long, default_value = "rust")]
+        runtime: String,
+        #[arg(long, default_value = "check")]
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
     Run {
         name: String,
         #[arg(long, default_value = "ylcc.yaml")]
@@ -256,6 +266,11 @@ enum Envs {
         id: String,
     },
     Status,
+    Ensure {
+        id: String,
+        #[arg(long)]
+        worker: Option<String>,
+    },
 }
 #[derive(Subcommand)]
 enum Services {
@@ -439,6 +454,34 @@ async fn diagnostics(hub: &str, token: &Path, local: Capabilities) -> Result<ser
     Ok(value)
 }
 
+fn task_template(runtime: &str, name: &str) -> Result<String> {
+    let (command, inputs, trust_command) = match runtime {
+        "rust" => (r#"    command: [cargo, test, --locked]"#, r#"    inputs: [Cargo.toml, Cargo.lock, src, tests]"#, "Rust"),
+        "node" => (r#"    command: [npm, test]"#, r#"    inputs: [package.json, package-lock.json, src, test]"#, "Node"),
+        "python" => (r#"    command: [python, -m, pytest, -q]"#, r#"    inputs: [pyproject.toml, src, tests]"#, "Python"),
+        "bun" => (r#"    command: [bun, test]"#, r#"    inputs: [package.json, bun.lock, src, tests]"#, "Bun"),
+        "go" => (r#"    command: [go, test, ./...]"#, r#"    inputs: [go.mod, go.sum, .]"#, "Go"),
+        _ => (r#"    command: [true]"#, r#"    no_input: true"#, "smoke-test"),
+    };
+    let _ = trust_command;
+    Ok(format!(
+        r#"version: 1
+tasks:
+  {name}:
+{command}
+{inputs}
+    requirements:
+      os: linux
+      arch: x86_64
+      tools: {{}}
+    outputs: []
+    timeout_secs: 1800
+    priority: 0
+"#,
+        name = name
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = execute().await {
@@ -513,7 +556,15 @@ async fn execute() -> Result<()> {
         }
         Commands::Manifest(s) => {
             let snap = s.snapshot()?;
-            print(&serde_json::json!({"files":snap.files,"excluded":snap.excluded}))
+            print(&serde_json::json!({
+                "files": snap.files,
+                "excluded": snap.excluded,
+                "summary": {
+                    "selected_files": snap.files.len(),
+                    "excluded_paths": snap.excluded.len(),
+                    "note": "The request path is a snapshot, not a live project: submit again after source changes."
+                }
+            }))
         }
         Commands::Run(r) => {
             let client = Client::new(&hub, &token)?;
@@ -544,6 +595,22 @@ async fn execute() -> Result<()> {
             Tasks::List { file } => {
                 let (project, _) = Project::load(&file)?;
                 print(&project.tasks)
+            }
+            Tasks::Init { file, runtime, name, force } => {
+                if file.exists() && !force {
+                    bail!("project file already exists: {}; pass --force to overwrite", file.display())
+                }
+                let parent = file.parent().unwrap_or(Path::new("."));
+                fs::create_dir_all(parent)?;
+                let template = task_template(runtime.as_str(), name.as_str())?;
+                fs::write(&file, template)?;
+                print(&serde_json::json!({
+                    "file": absolute_path(&file)?,
+                    "runtime": runtime,
+                    "name": name,
+                    "overwritten": force && file.exists()
+                }))?;
+                Ok(())
             }
             Tasks::Run {
                 name,
@@ -699,6 +766,18 @@ async fn execute() -> Result<()> {
                         .await?,
                     )
                 }
+                Envs::Ensure { id, worker } => {
+                    ylcc::client::segment(&id)?;
+                    let statuses = c.get::<Vec<EnvironmentStatus>>("/v1/environments/status").await.unwrap_or_default();
+                    let current = statuses.into_iter().find(|s| s.environment_id == *id);
+                    if current.as_ref().is_none_or(|s| s.state != "ready") {
+                        ylcc::client::segment(&id)?;
+                        let prepared = c.post::<_, Vec<EnvironmentStatus>>(&format!("/v1/environments/{id}/prepare"), &PrepareRequest { worker_id: worker.clone() }).await?;
+                        print(&serde_json::json!({"environment": id, "action": "prepared", "statuses": prepared}))
+                    } else {
+                        print(&serde_json::json!({"environment": id, "action": "reused", "status": current}))
+                    }
+                }
             }
         }
         Commands::Status => {
@@ -713,6 +792,7 @@ async fn execute() -> Result<()> {
                 "summary": {
                     "workers": workers.len(),
                     "online_workers": workers.iter().filter(|w| !stale_last_seen(w.last_seen)).count(),
+                    "workers_with_unknown_heartbeat": workers.iter().filter(|w| stale_last_seen(w.last_seen)).count(),
                     "total_jobs": jobs.len(),
                     "queued": jobs.iter().filter(|j| j.state == "queued").count(),
                     "assigned": jobs.iter().filter(|j| j.state == "assigned").count(),

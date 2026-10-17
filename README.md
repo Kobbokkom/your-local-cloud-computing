@@ -502,6 +502,31 @@ From the [support checkout](#download-examples-and-agent-support-files), the [CU
 
 macOS/Xcode work requires a native Mac worker and the appropriate SDK. Requesting Linux x86_64 from an Apple Silicon laptop selects a matching worker; it does not make the result a macOS executable. Cross-compilation needs the relevant linker/sysroot/SDK and an explicit build command. Emulation is not implemented in v0.2.0.
 
+## Setup and fast task templates
+
+Run first-run discovery without printing secrets:
+
+```bash
+ylcc setup
+ylcc examples
+```
+
+Create a project task file in the current application repository:
+
+```bash
+ylcc task init --runtime bun --name test --file ylcc.yaml
+ylcc task init --runtime rust --name test --file ylcc.yaml
+ylcc task list
+ylcc task run test --detach
+```
+
+Reuse a prepared environment before trusting it:
+
+```bash
+ylcc env status
+ylcc env ensure my-tools --worker WORKER_ID
+```
+
 ## Diagnose and develop
 
 `ylcc doctor` reports local capabilities and configured workers. Check service logs, actual service-account `PATH`, token permissions, private HTTPS reachability and container runtime access first. A worker connection loss is distinct from command failure. Persist the hub database/blob directory and worker data; do not delete an unknown attempt's files while its process may still be running.
