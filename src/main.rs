@@ -32,6 +32,8 @@ struct Cli {
 enum Commands {
     /// Generate a protected pool token (never prints its contents).
     Init,
+    /// Show first-run setup state and next command; does not modify secrets by default.
+    Setup,
     /// Save requester defaults, including token file reference.
     Configure,
     Hub {
@@ -70,6 +72,8 @@ enum Commands {
         command: Envs,
     },
     Doctor,
+    /// Print natural-language prompts and the commands agents should run.
+    Examples,
     /// Machine-readable status summary for agents: health, workers and job states.
     Status,
     /// Print the verified install/upgrade command for this platform without exposing tokens.
@@ -716,6 +720,54 @@ async fn execute() -> Result<()> {
                     "succeeded": jobs.iter().filter(|j| j.state == "succeeded").count(),
                     "failed": jobs.iter().filter(|j| j.state == "failed").count(),
                 }
+            }))?;
+            Ok(())
+        }
+        Commands::Setup => {
+            let mut actions = Vec::new();
+            if !token.exists() { actions.push("ylcc init"); }
+            if !cfg_path.exists() { actions.push("ylcc configure"); }
+            if !results.exists() { actions.push("mkdir -p <results_dir>"); }
+            actions.push("ylcc doctor");
+            actions.push("ylcc examples");
+            let setup = serde_json::json!({
+                "schema": "first-run-v1",
+                "config_file": cfg_path,
+                "config_exists": cfg_path.exists(),
+                "token_file": token,
+                "token_exists": token.exists(),
+                "results_dir": results,
+                "results_exists": results.exists(),
+                "next_actions": actions,
+                "hint": "Secret values are never printed. Run ylcc configure once the token exists."
+            });
+            print(&setup)?;
+            Ok(())
+        }
+        Commands::Examples => {
+            print(&serde_json::json!({
+                "examples": [
+                    {
+                        "prompt": "Check the pool and workers, but do not run anything.",
+                        "commands": ["ylcc --json status", "ylcc --json workers"]
+                    },
+                    {
+                        "prompt": "Run this only on a powered Windows x86_64 worker.",
+                        "commands": ["ylcc --json workers", "ylcc run --os windows --arch x86_64 --no-input --json -- powershell -NoProfile -Command \"...\""]
+                    },
+                    {
+                        "prompt": "Build this on Linux x86_64 and bring back the binary.",
+                        "commands": ["ylcc --json manifest --project", "ylcc run --input Cargo.toml --input Cargo.lock --input src --os linux --arch x86_64 --output target/release/my-tool --detach -- cargo build --locked --release", "ylcc jobs wait JOB_ID"]
+                    },
+                    {
+                        "prompt": "Use the reviewed project task.",
+                        "commands": ["ylcc --json task list", "ylcc task run TASK --detach", "ylcc --json jobs wait JOB_ID"]
+                    },
+                    {
+                        "prompt": "Open the dashboard without giving me the token in chat.",
+                        "commands": ["ylcc dashboard --open"]
+                    }
+                ]
             }))?;
             Ok(())
         }
