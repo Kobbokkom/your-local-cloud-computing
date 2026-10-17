@@ -1,3 +1,4 @@
+const tokenKey = 'ylcc-dashboard-token'
 import { useEffect, useState, type FormEvent } from 'react'
 import {
   Activity,
@@ -36,8 +37,12 @@ const activeJobStates = new Set(['assigned', 'running'])
 function App() {
   const [token, setToken] = useState(() => {
     const hashToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
-    if (hashToken) window.history.replaceState(null, '', window.location.pathname + window.location.search)
-    return hashToken ?? ''
+    if (hashToken) {
+      sessionStorage.setItem(tokenKey, hashToken)
+      window.history.replaceState(null, '', window.location.pathname + window.location.search)
+      return hashToken
+    }
+    return sessionStorage.getItem(tokenKey) ?? ''
   })
   const [tokenInput, setTokenInput] = useState('')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
@@ -110,12 +115,14 @@ function App() {
     if (!next) return
     setToken(next)
     setTokenInput('')
+    sessionStorage.setItem(tokenKey, next)
     setSnapshot(null)
   }
 
   const disconnect = () => {
     setToken('')
     setSnapshot(null)
+    sessionStorage.removeItem(tokenKey)
     setError('')
   }
 
