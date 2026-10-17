@@ -66,7 +66,7 @@ button { cursor: pointer; }
 .account-copy strong { color: #e0e8f0; font-size: 11px; font-weight: 600; }
 .account-copy small { color: #91a2b3; font-size: 10px; }
 
-.main-panel { min-width: 0; }
+.main-panel { min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
 .topbar { position: sticky; z-index: 2; top: 0; height: 59px; display: flex; align-items: center; justify-content: space-between; padding: 0 34px; border-bottom: 1px solid var(--border); background: rgb(255 255 255 / 95%); }
 .breadcrumb { display: flex; align-items: center; gap: 10px; color: #738194; font-size: 12px; }
 .breadcrumb strong { color: #27374a; font-weight: 600; }
@@ -90,7 +90,7 @@ button { cursor: pointer; }
 .icon-button:hover { background: #edf1f5; }
 .spin { animation: spin 900ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.page-content { width: min(100%, 1440px); margin: 0 auto; padding: 28px 34px 20px; }
+.page-content { width: min(100%, 1440px); margin: 0 auto; padding: 28px 34px 20px; flex: 1 0 auto; }
 .security-notice, .error-notice { display: flex; align-items: flex-start; gap: 9px; margin: 0 0 16px; padding: 10px 12px; border: 1px solid #f0c38f; border-radius: 5px; color: #71410f; background: #fff6e9; font-size: 12px; line-height: 1.45; }
 .error-notice { border-color: #e9b8b3; color: #802d25; background: #fff1ef; }
 .security-notice svg, .error-notice svg { flex: 0 0 auto; margin-top: 1px; }
@@ -160,7 +160,7 @@ button { cursor: pointer; }
 .empty-state strong { color: #34465a; font-size: 12px; font-weight: 600; }
 .empty-state p { margin: 4px 0 0; color: #6e7c8d; font-size: 11px; }
 .view-section { margin-top: 2px; }
-.page-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 13px; border-top: 1px solid #dfe5eb; color: #718094; font-size: 10px; }
+.page-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 13px; border-top: 1px solid #dfe5eb; color: #718094; font-size: 10px; margin-top: auto; }
 .page-footer span:first-child { display: inline-flex; align-items: center; gap: 6px; }
 .page-footer svg { color: #438c72; }
 .loading-state { min-height: 360px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #44566b; text-align: center; }
