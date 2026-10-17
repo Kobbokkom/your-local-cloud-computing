@@ -19,8 +19,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust stable
         run: rustup update stable --no-self-update && rustup default stable
-        - name: Build dashboard assets
-          run: npm ci --prefix dashboard && npm run build --prefix dashboard
+      - name: Build dashboard assets
+        run: npm ci --prefix dashboard && npm run build --prefix dashboard
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 tests/e2e.py target/debug/ylcc
@@ -37,8 +37,8 @@ jobs:
           rustup update stable --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default stable
-        - name: Build dashboard assets
-          run: npm ci --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build dashboard assets
+        run: npm ci --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python tests/e2e.py target/debug/ylcc.exe
