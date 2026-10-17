@@ -74,6 +74,13 @@ enum Commands {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Preview or remove downloaded job result directories older than the given number of days.
+    Cleanup {
+        #[arg(long, default_value_t = 30)]
+        older_than_days: u64,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Print the Hub dashboard address and token-file location. Does not print the token value.
     Dashboard {
         #[arg(long)]
@@ -657,6 +664,42 @@ async fn execute() -> Result<()> {
                 "preserved": ["config.json", "token file", "results_dir", "worker data", "hub data", "background service IDs unless you reinstall"],
                 "command": command,
                 "note": "Drain active jobs and stop hub/worker services before replacing a running binary; verify with `ylcc --version` afterward."
+            }))?;
+            Ok(())
+        }
+        Commands::Cleanup { older_than_days, apply } => {
+            use std::time::{Duration, SystemTime};
+            let cutoff = SystemTime::now()
+                .checked_sub(Duration::from_secs(older_than_days * 86400))
+                .context("invalid retention period")?;
+            let mut candidates = Vec::new();
+            if results.exists() {
+                for entry in fs::read_dir(&results)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let modified = entry.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    if modified < cutoff {
+                        candidates.push((path, modified));
+                    }
+                }
+            }
+            candidates.sort_by(|a,b| a.0.cmp(&b.0));
+            if apply {
+                for (path, _) in &candidates {
+                    fs::remove_dir_all(path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                }
+            }
+            print(&serde_json::json!({
+                "results_dir": results,
+                "older_than_days": older_than_days,
+                "mode": if apply {"applied"} else {"dry-run"},
+                "candidate_count": candidates.len(),
+                "candidates": candidates.iter().map(|(p,_)| p.display().to_string()).collect::<Vec<_>>(),
+                "note": if apply {"Removed. Rerun without --apply to preview."} else {"No files were deleted; rerun with --apply to remove."}
             }))?;
             Ok(())
         }
