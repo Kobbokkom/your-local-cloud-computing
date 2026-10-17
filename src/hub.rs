@@ -14,6 +14,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OptionalExtension, params};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
@@ -28,6 +29,10 @@ use uuid::Uuid;
 
 type Shared = Arc<Mutex<Store>>;
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+#[derive(RustEmbed)]
+#[folder = "dashboard/dist/"]
+struct DashboardAssets;
 
 #[derive(Debug)]
 struct ApiError(StatusCode, String);
@@ -930,6 +935,8 @@ fn router(state: Shared) -> Router {
         .route("/v1/worker/ws", get(worker_socket))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
+        .route("/", get(dashboard_index))
+        .route("/{*path}", get(dashboard_asset))
         .route(
             "/health",
             get(|| async {
@@ -943,6 +950,46 @@ fn router(state: Shared) -> Router {
         .merge(protected)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+async fn dashboard_index() -> Response {
+    dashboard_asset(Path("index.html".into())).await
+}
+async fn dashboard_asset(Path(path): Path<String>) -> Response {
+    if path == "v1" || path.starts_with("v1/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = if path.is_empty() { "index.html" } else { &path };
+    let asset = DashboardAssets::get(path).or_else(|| {
+        (!path.contains('.') && !path.starts_with("assets/"))
+            .then(|| DashboardAssets::get("index.html"))
+            .flatten()
+    });
+    let Some(asset) = asset else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    let mut response = Response::new(Body::from(asset.data.into_owned()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        content_type.parse().expect("valid content type"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-cache".parse().expect("valid cache control"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        "nosniff".parse().expect("valid security header"),
+    );
+    response
 }
 async fn authenticate(
     State(state): State<Shared>,
@@ -1388,6 +1435,30 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dashboard_serves_embedded_assets_but_not_unknown_api_paths() {
+        let index = dashboard_index().await;
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(
+            index.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let html = axum::body::to_bytes(index.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(html.starts_with(b"<!doctype html>"));
+
+        let script = dashboard_asset(Path("assets/dashboard.js".into())).await;
+        assert_eq!(script.status(), StatusCode::OK);
+        assert_eq!(
+            script.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+
+        let unknown_api = dashboard_asset(Path("v1/not-a-route".into())).await;
+        assert_eq!(unknown_api.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

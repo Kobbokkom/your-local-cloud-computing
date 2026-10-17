@@ -4,10 +4,18 @@ RUN apk add --no-cache python3 \
     && python3 /tmp/docker-client-notices.py --self-test \
     && python3 /tmp/docker-client-notices.py --output /tmp/DOCKER-CLI-NOTICES.txt
 
+FROM node:24-alpine AS dashboard-builder
+WORKDIR /dashboard
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard/ ./
+RUN npm run build
+
 FROM rust:1.96-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY --from=dashboard-builder /dashboard/dist ./dashboard/dist
 RUN rustup component add rust-docs \
     && cargo build --locked --release \
     && cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" /build/RUST-STANDARD-LIBRARY.html

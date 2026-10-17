@@ -67,10 +67,16 @@ Keep this directory for the examples below. Reuse it if already cloned; it conta
 To build the CLI from this checkout instead of downloading a binary:
 
 ```bash
+npm ci --prefix "$YLCC_SUPPORT_DIR/dashboard"
+npm run build --prefix "$YLCC_SUPPORT_DIR/dashboard"
 cargo build --manifest-path "$YLCC_SUPPORT_DIR/Cargo.toml" --locked --release
 mkdir -p "$HOME/.local/bin"
 install -m 755 "$YLCC_SUPPORT_DIR/target/release/ylcc" "$HOME/.local/bin/ylcc"
 ```
+
+## Updating an existing installation
+
+Run installer with desired version; config/token/data are preserved.
 
 ## Windows containers
 
@@ -189,6 +195,10 @@ On an always-on machine, create a token and a persistent hub directory. `init` g
 ylcc init
 ylcc hub --listen 127.0.0.1:7443 --data-dir "$HOME/.local/share/ylcc/hub"
 ```
+
+The Hub serves its read-only dashboard at the same address. Open `http://127.0.0.1:7443/` on the Hub machine, or use the private HTTPS address from another device, then enter the pool token in the browser. The dashboard shows workers, jobs and environment readiness and refreshes every five seconds. Its token is kept only in that browser tab.
+
+The Hub itself does not provide TLS. Do not send the pool token over plain HTTP on an untrusted network; use a private HTTPS endpoint such as Tailscale Serve. For direct LAN access, bind the Hub to a reachable private interface and apply the host firewall's normal restrictions.
 
 In another terminal, publish only to your private network. For example, with Tailscale installed and HTTPS enabled for your tailnet:
 
