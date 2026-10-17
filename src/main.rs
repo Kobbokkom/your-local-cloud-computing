@@ -83,8 +83,9 @@ enum Commands {
     },
     /// Print the Hub dashboard address and token-file location. Does not print the token value.
     Dashboard {
+        /// Do not launch a browser; print the URL and token-file path only.
         #[arg(long)]
-        open: bool,
+        no_open: bool,
     },
     Service {
         #[command(subcommand)]
@@ -712,7 +713,8 @@ async fn execute() -> Result<()> {
             }))?;
             Ok(())
         }
-        Commands::Dashboard { open } => {
+        Commands::Dashboard { no_open } => {
+            let open = !no_open;
             let url = format!("{}/", hub.trim_end_matches('/'));
             print(&serde_json::json!({
                 "dashboard_url": url,
