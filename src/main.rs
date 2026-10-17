@@ -70,6 +70,8 @@ enum Commands {
         command: Envs,
     },
     Doctor,
+    /// Machine-readable status summary for agents: health, workers and job states.
+    Status,
     /// Print the verified install/upgrade command for this platform without exposing tokens.
     Update {
         #[arg(long)]
@@ -289,6 +291,15 @@ fn default_worker_id() -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "ylcc-worker".to_string())
 }
+
+fn stale_last_seen(last_seen: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(last_seen);
+    now.saturating_sub(last_seen) > 300
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -685,6 +696,28 @@ async fn execute() -> Result<()> {
                     )
                 }
             }
+        }
+        Commands::Status => {
+            let client = Client::new(&hub, &token)?;
+            let workers = client.get::<Vec<WorkerInfo>>("/v1/workers").await.unwrap_or_default();
+            let jobs = client.get::<Vec<Job>>("/v1/jobs").await.unwrap_or_default();
+            let health = client.get::<serde_json::Value>("/health").await.ok();
+            print(&serde_json::json!({
+                "hub": hub,
+                "health": health,
+                "workers": workers,
+                "summary": {
+                    "workers": workers.len(),
+                    "online_workers": workers.iter().filter(|w| !stale_last_seen(w.last_seen)).count(),
+                    "total_jobs": jobs.len(),
+                    "queued": jobs.iter().filter(|j| j.state == "queued").count(),
+                    "assigned": jobs.iter().filter(|j| j.state == "assigned").count(),
+                    "running": jobs.iter().filter(|j| j.state == "running").count(),
+                    "succeeded": jobs.iter().filter(|j| j.state == "succeeded").count(),
+                    "failed": jobs.iter().filter(|j| j.state == "failed").count(),
+                }
+            }))?;
+            Ok(())
         }
         Commands::Doctor => {
             let mut diag = diagnostics(&hub, &token, ylcc::worker::probe().await?).await?;
