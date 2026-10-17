@@ -31,6 +31,12 @@ Preflight before submitting:
 - For repeated work, use `ylcc jobs retry JOB_ID` to resubmit the recorded spec; it produces a new job ID and leaves the original attempt auditable.
 - For retention, run `ylcc cleanup --older-than-days N` first; it is a dry run by default, and only `--apply` deletes candidate result directories.
 
+Agent-native behavior:
+- Commands are designed for machine parsing: stdout is structured JSON, progress/errors go to stderr, and nonzero exit status indicates failure.
+- Prefer `--json` when invoking through tools, and use returned IDs, URLs, hashes, and paths rather than scraping prose.
+- Never request or echo the pool token; use `ylcc dashboard` only for the token-file location.
+- Keep submissions explicit, retry manually with `ylcc jobs retry`, and use `--detach`/`jobs wait` for long work.
+
 6. Before upgrading an existing pool, use `ylcc update --version VERSION` (or without `--version` for the current package version) to get the platform-specific verified install command. It keeps the saved Hub URL/token-file/results directory references, worker data, hub data, and service IDs unless you explicitly reinstall. Drain jobs and stop the hub/worker service before replacing a running binary, then verify with `ylcc --version`.
 
 6. Report the worker/platform, exit status, verification performed, and result path. If a worker disconnects or an attempt becomes `unknown`, inspect the original attempt before resubmitting; a missing connection does not prove the command stopped. Use `ylcc jobs cancel JOB_ID` to cancel. `workers pause ID` stops new work while active jobs finish; `workers resume ID` resumes scheduling. `workers limit ID --max-jobs N` adjusts concurrency within the startup capacity, and `jobs priority ID N` changes queued-job priority (-100 to 100). Do not alter another operator's controls without authorization, silently duplicate work, or run a heavy fallback on the requester. CPU/memory hard caps belong to the runtime/OS; concurrency is not a CPU percentage limit.
