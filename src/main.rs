@@ -643,7 +643,16 @@ async fn execute() -> Result<()> {
                 }
             }
         }
-        Commands::Doctor => print(&diagnostics(&hub, &token, ylcc::worker::probe().await?).await?),
+        Commands::Doctor => {
+            let mut diag = diagnostics(&hub, &token, ylcc::worker::probe().await?).await?;
+            if let serde_json::Value::Object(map) = &mut diag {
+                map.insert("ylcc_version".into(), serde_json::Value::String(env!("CARGO_PKG_VERSION").into()));
+                map.insert("config_file".into(), serde_json::Value::String(config_path().display().to_string()));
+                map.insert("token_file".into(), serde_json::Value::String(token.display().to_string()));
+                map.insert("results_dir".into(), serde_json::Value::String(results.display().to_string()));
+            }
+            print(&diag)
+        }
         Commands::Update { version } => {
             let version = version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
             let is_windows = cfg!(target_os = "windows");
