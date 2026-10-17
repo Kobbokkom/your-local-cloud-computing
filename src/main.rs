@@ -170,7 +170,7 @@ enum Tasks {
     Init {
         #[arg(long, default_value = "ylcc.yaml")]
         file: PathBuf,
-        #[arg(long, default_value = "rust")]
+        #[arg(long, default_value = "rust", value_parser = ["rust", "node", "python", "bun", "go", "smoke"])]
         runtime: String,
         #[arg(long, default_value = "check")]
         name: String,
@@ -259,8 +259,8 @@ enum Envs {
     },
     Prepare {
         id: String,
-        #[arg(long)]
-        worker: Option<String>,
+        #[arg(long, required = true)]
+        worker: String,
     },
     Logs {
         id: String,
@@ -268,8 +268,8 @@ enum Envs {
     Status,
     Ensure {
         id: String,
-        #[arg(long)]
-        worker: Option<String>,
+        #[arg(long, required = true)]
+        worker: String,
     },
 }
 #[derive(Subcommand)]
@@ -597,7 +597,8 @@ async fn execute() -> Result<()> {
                 print(&project.tasks)
             }
             Tasks::Init { file, runtime, name, force } => {
-                if file.exists() && !force {
+                let existed_before = file.exists();
+                if existed_before && !force {
                     bail!("project file already exists: {}; pass --force to overwrite", file.display())
                 }
                 let parent = file.parent().unwrap_or(Path::new("."));
@@ -608,7 +609,7 @@ async fn execute() -> Result<()> {
                     "file": absolute_path(&file)?,
                     "runtime": runtime,
                     "name": name,
-                    "overwritten": force && file.exists()
+                    "overwritten": force && existed_before
                 }))?;
                 Ok(())
             }
@@ -761,18 +762,18 @@ async fn execute() -> Result<()> {
                     print(
                         &c.post::<_, Vec<EnvironmentStatus>>(
                             &format!("/v1/environments/{id}/prepare"),
-                            &PrepareRequest { worker_id: worker },
+                            &PrepareRequest { worker_id: Some(worker) },
                         )
                         .await?,
                     )
                 }
                 Envs::Ensure { id, worker } => {
                     ylcc::client::segment(&id)?;
-                    let statuses = c.get::<Vec<EnvironmentStatus>>("/v1/environments/status").await.unwrap_or_default();
+                    let statuses = c.get::<Vec<EnvironmentStatus>>("/v1/environments/status").await?;
                     let current = statuses.into_iter().find(|s| s.environment_id == *id);
                     if current.as_ref().is_none_or(|s| s.state != "ready") {
                         ylcc::client::segment(&id)?;
-                        let prepared = c.post::<_, Vec<EnvironmentStatus>>(&format!("/v1/environments/{id}/prepare"), &PrepareRequest { worker_id: worker.clone() }).await?;
+                        let prepared = c.post::<_, Vec<EnvironmentStatus>>(&format!("/v1/environments/{id}/prepare"), &PrepareRequest { worker_id: Some(worker.clone()) }).await?;
                         print(&serde_json::json!({"environment": id, "action": "prepared", "statuses": prepared}))
                     } else {
                         print(&serde_json::json!({"environment": id, "action": "reused", "status": current}))
