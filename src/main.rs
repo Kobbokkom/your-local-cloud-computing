@@ -207,6 +207,14 @@ enum Jobs {
     Cancel {
         id: String,
     },
+    /// Resubmit an existing job using its recorded spec.
+    Retry {
+        id: String,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        no_download: bool,
+    },
     /// Change the priority of a queued job (-100 through 100).
     Priority {
         id: String,
@@ -575,6 +583,21 @@ async fn execute() -> Result<()> {
                         &c.post::<_, Job>(&format!("/v1/jobs/{id}/cancel"), &serde_json::json!({}))
                             .await?,
                     )
+                }
+                Jobs::Retry { id, detach, no_download } => {
+                    ylcc::client::segment(&id)?;
+                    let previous = c.job(&id).await?;
+                    let job: Job = c.post("/v1/jobs", &previous.spec).await?;
+                    if detach {
+                        print(&job)
+                    } else {
+                        let j = c.wait(&job.id, &results, !no_download).await?;
+                        print(&j)?;
+                        if j.state != "succeeded" {
+                            bail!("job {} finished with state {}", j.id, j.state)
+                        }
+                        Ok(())
+                    }
                 }
                 Jobs::Priority { id, priority } => {
                     ylcc::client::segment(&id)?;
