@@ -258,7 +258,7 @@ function ConnectScreen({
         <div className="connect-brand"><span className="brand-mark"><Workflow size={19} /></span><span>YLCC</span></div>
         <div className="connect-icon"><LockKeyhole size={21} /></div>
         <h1>Connect to your Hub</h1>
-        <p className="connect-description">Enter the pool token configured for this Hub. Your dashboard reads status from this address.</p>
+        <p className="connect-description">Enter the pool token configured for this Hub. Find its local file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
         <div className="endpoint-field"><span className="online-dot" />{window.location.origin}</div>
         <form onSubmit={onSubmit} className="connect-form">
           <label htmlFor="pool-token">Pool token</label>
@@ -278,7 +278,7 @@ function ConnectScreen({
             Connect to Hub <Check size={16} />
           </Button>
         </form>
-        <div className="session-note"><ShieldCheck size={15} /> Token stays in this browser tab and is cleared when you disconnect.</div>
+        <div className="session-note"><ShieldCheck size={15} /> Token stays in this browser tab and is cleared when you disconnect. Copy it from your local token file; never paste it into chat or logs.</div>
       </section>
       <span className="connect-version">YLCC · self-hosted compute</span>
     </main>

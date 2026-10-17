@@ -69,6 +69,11 @@ enum Commands {
         command: Envs,
     },
     Doctor,
+    /// Print the verified install/upgrade command for this platform without exposing tokens.
+    Update {
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Print the Hub dashboard address and token-file location. Does not print the token value.
     Dashboard {
         #[arg(long)]
@@ -609,6 +614,29 @@ async fn execute() -> Result<()> {
             }
         }
         Commands::Doctor => print(&diagnostics(&hub, &token, ylcc::worker::probe().await?).await?),
+        Commands::Update { version } => {
+            let version = version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+            let is_windows = cfg!(target_os = "windows");
+            let command = if is_windows {
+                format!(
+                    "$env:YLCC_VERSION='{}'; irm https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.ps1 | iex",
+                    version, version
+                )
+            } else {
+                format!(
+                    "YLCC_VERSION={} curl -fsSL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.sh | sh -s -- --version {}",
+                    version, version, version
+                )
+            };
+            print(&serde_json::json!({
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "target_version": version.trim_start_matches('v'),
+                "preserved": ["config.json", "token file", "results_dir", "worker data", "hub data", "background service IDs unless you reinstall"],
+                "command": command,
+                "note": "Drain active jobs and stop hub/worker services before replacing a running binary; verify with `ylcc --version` afterward."
+            }))?;
+            Ok(())
+        }
         Commands::Dashboard { open } => {
             let url = format!("{}/", hub.trim_end_matches('/'));
             print(&serde_json::json!({
