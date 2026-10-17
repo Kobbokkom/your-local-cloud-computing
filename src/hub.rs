@@ -14,6 +14,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(dashboard_assets)]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -30,8 +31,12 @@ use uuid::Uuid;
 type Shared = Arc<Mutex<Store>>;
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+#[cfg(dashboard_assets)]
 #[derive(RustEmbed)]
 #[folder = "dashboard/dist/"]
+struct DashboardAssets;
+
+#[cfg(not(dashboard_assets))]
 struct DashboardAssets;
 
 #[derive(Debug)]
@@ -954,6 +959,7 @@ fn router(state: Shared) -> Router {
 async fn dashboard_index() -> Response {
     dashboard_asset(Path("index.html".into())).await
 }
+#[cfg(dashboard_assets)]
 async fn dashboard_asset(Path(path): Path<String>) -> Response {
     if path == "v1" || path.starts_with("v1/") {
         return StatusCode::NOT_FOUND.into_response();
@@ -2205,4 +2211,9 @@ mod tests {
         assert!(missing.hashes.is_empty());
         task.abort();
     }
+}
+
+#[cfg(not(dashboard_assets))]
+async fn dashboard_asset(Path(_path): Path<String>) -> Response {
+    StatusCode::NOT_FOUND.into_response()
 }
