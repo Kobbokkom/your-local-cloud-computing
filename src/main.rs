@@ -716,18 +716,35 @@ async fn execute() -> Result<()> {
         Commands::Dashboard { no_open } => {
             let open = !no_open;
             let url = format!("{}/", hub.trim_end_matches('/'));
+            let token_value = fs::read_to_string(&token).ok().map(|s| s.trim().to_string()).unwrap_or_default();
             print(&serde_json::json!({
                 "dashboard_url": url,
+                "token": token_value,
                 "token_file": token,
-                "token guidance": "Run `cat` on token_file in your own shell, then paste it into the dashboard. ylcc does not print or prefill the token.",
+                "token_guidance": "The dashboard URL already applies this token through the browser fragment when opened with --open. Keep this output private; never paste it into chat, logs, tickets, or screenshots.",
             }))?;
+            let browser_url = if open {
+                match fs::read_to_string(&token) {
+                    Ok(value) => {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            format!("{}#token={}", url.trim_end_matches('/'), value)
+                        } else {
+                            url.clone()
+                        }
+                    }
+                    _ => url.clone(),
+                }
+            } else {
+                url.clone()
+            };
             if open {
                 #[cfg(target_os = "macos")]
-                let opened = std::process::Command::new("open").arg(&url).status().is_ok();
+                let opened = std::process::Command::new("open").arg(&browser_url).status().is_ok();
                 #[cfg(target_os = "windows")]
-                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &url]).status().is_ok();
+                let opened = std::process::Command::new("cmd").args(["/C", "start", "", &browser_url]).status().is_ok();
                 #[cfg(target_os = "linux")]
-                let opened = std::process::Command::new("xdg-open").arg(&url).status().is_ok();
+                let opened = std::process::Command::new("xdg-open").arg(&browser_url).status().is_ok();
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let opened = false;
                 if !opened {

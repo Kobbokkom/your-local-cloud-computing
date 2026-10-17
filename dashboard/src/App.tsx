@@ -35,7 +35,15 @@ const tokenKey = 'ylcc-dashboard-token'
 const activeJobStates = new Set(['assigned', 'running'])
 
 function App() {
-  const [token, setToken] = useState(() => sessionStorage.getItem(tokenKey) ?? '')
+  const [token, setToken] = useState(() => {
+    const hashToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
+    if (hashToken) {
+      sessionStorage.setItem(tokenKey, hashToken)
+      window.history.replaceState(null, '', window.location.pathname + window.location.search)
+      return hashToken
+    }
+    return sessionStorage.getItem(tokenKey) ?? ''
+  })
   const [tokenInput, setTokenInput] = useState('')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [error, setError] = useState('')
